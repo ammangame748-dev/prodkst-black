@@ -1,21 +1,27 @@
 {
-  "name": "blacklist-dashboard",
+  "name": "x-gamer-bot",
   "version": "1.0.0",
-  "description": "BLACKLIST Discord Broadcast Dashboard",
+  "description": "X-Gamer: The ultimate Discord roulette bot with fire design",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "node --watch index.js"
   },
+  "keywords": [
+    "discord",
+    "bot",
+    "roulette",
+    "game",
+    "x-gamer"
+  ],
+  "author": "X-Gamer",
+  "license": "MIT",
   "dependencies": {
-    "discord.js": "^14.14.1",
-    "express": "^4.18.2",
-    "express-session": "^1.17.3",
-    "passport": "^0.7.0",
-    "passport-discord": "^0.1.4",
+    "discord.js": "^14.14.0",
     "dotenv": "^16.3.1"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "18.x"
   }
 }
