@@ -6,6 +6,9 @@ const DiscordStrategy = require('passport-discord').Strategy;
 const path = require('path');
 const axios = require('axios');
 require('dotenv').config();
+const crypto = require('crypto'); // أضف هذا السطر
+const rouletteGamesCache = new Map(); // وأضف هذا السطر أيضاً
+
 
 // --- الإعدادات الأولية ---
 const app = express();
@@ -31,9 +34,10 @@ const client = new Client({
     partials: [Partials.Channel]
 });
 
-client.on('ready', () => {
-    console.log(`Logged in as ${client.user.tag}!`);
+client.on('clientReady', (c) => {
+    console.log(`Logged in as ${c.user.tag}!`);
 });
+
 
 // أمر تشغيل الروليت
 client.on('messageCreate', async (message) => {
@@ -60,6 +64,12 @@ client.on('messageCreate', async (message) => {
             username: m.user.username,
             avatar: m.user.displayAvatarURL({ extension: 'png' })
         }));
+// توليد معرف قصير وحفظ اللاعبين في الذاكرة
+const gameId = crypto.randomBytes(6).toString('hex');
+rouletteGamesCache.set(gameId, players);
+
+// حذف اللعبة بعد ساعة لتوفير الذاكرة
+setTimeout(() => { rouletteGamesCache.delete(gameId); }, 60 * 60 * 1000);
 
         const embed = new EmbedBuilder()
             .setTitle('X-Gamer Roulette')
@@ -71,7 +81,8 @@ client.on('messageCreate', async (message) => {
             .addComponents(
                 new ButtonBuilder()
                     .setLabel('مشاهدة الروليت')
-                    .setURL(`${process.env.DOMAIN || 'http://localhost:3000'}/view/${message.guild.id}?p=${encodeURIComponent(JSON.stringify(players))}`)
+                    .setURL(`${process.env.DOMAIN || 'http://localhost:3000'}/view/${message.guild.id}?g=${gameId}`)
+
                     .setStyle(ButtonStyle.Link)
             );
 
@@ -268,10 +279,15 @@ app.post('/api/settings/:guildID', (req, res) => {
     };
     res.sendStatus(200);
 });
-
 // عرض الروليت (Slider)
 app.get('/view/:guildID', (req, res) => {
-    const players = JSON.parse(decodeURIComponent(req.query.p || '[]'));
+    const gameId = req.query.g;
+    const players = rouletteGamesCache.get(gameId) || [];
+    
+    if (players.length === 0) {
+        return res.status(404).send('<h1>عذراً، انتهت صلاحية هذا السحب أو الرابط غير صالح!</h1>');
+    }
+
     const guildID = req.params.guildID;
     const settings = botSettings.guilds[guildID] || botSettings;
     const color = settings.color || '#ff0000';
