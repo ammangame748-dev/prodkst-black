@@ -1,482 +1,396 @@
-import { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } from 'discord.js';
-import dotenv from 'dotenv';
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const express = require('express');
+const session = require('express-session');
+const passport = require('passport');
+const DiscordStrategy = require('passport-discord').Strategy;
+const path = require('path');
+const axios = require('axios');
+require('dotenv').config();
 
-dotenv.config();
+// --- الإعدادات الأولية ---
+const app = express();
+const port = process.env.PORT || 3000;
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
-  ],
-});
-
-// Store active games and server settings
-const activeGames = new Map();
-const serverSettings = new Map();
-
-// Default settings
-const DEFAULT_SETTINGS = {
-  rouletteColor: '#FF0000',
-  maxPlayers: 10,
-  minPlayers: 2,
-  allowedRoleId: null,
-  allowedChannelId: null,
+// تخزين الإعدادات (في الواقع يفضل استخدام قاعدة بيانات، لكن للتبسيط سنستخدم كائن في الذاكرة)
+let botSettings = {
+    color: '#ff0000',
+    maxPlayers: 10,
+    allowedRole: '',
+    targetChannel: '',
+    guilds: {}
 };
 
-// ==================== EVENT LISTENERS ====================
+// --- إعداد بوت ديسكورد ---
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
+    ],
+    partials: [Partials.Channel]
+});
 
 client.on('ready', () => {
-  console.log(`[X-GAMER] Bot logged in as ${client.user.tag}`);
-  console.log(`[X-GAMER] Ready to spin the wheel!`);
-  client.user.setActivity('X-GAMER Roulette', { type: 'PLAYING' });
+    console.log(`Logged in as ${client.user.tag}!`);
 });
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+// أمر تشغيل الروليت
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    
+    // التحقق من الرتبة المسموح لها (إذا كانت محددة)
+    const guildSettings = botSettings.guilds[message.guild.id] || botSettings;
+    if (guildSettings.allowedRole && !message.member.roles.cache.has(guildSettings.allowedRole)) return;
 
-  const guildId = interaction.guildId;
-  const settings = serverSettings.get(guildId) || DEFAULT_SETTINGS;
+    if (message.content === '!roulette') {
+        if (guildSettings.targetChannel && message.channel.id !== guildSettings.targetChannel) {
+            return message.reply(`هذا الأمر يعمل فقط في الروم المحدد: <#${guildSettings.targetChannel}>`);
+        }
 
-  // Check role permission
-  if (settings.allowedRoleId && !interaction.member.roles.cache.has(settings.allowedRoleId)) {
-    return interaction.reply({
-      content: 'You do not have permission to use this command.',
-      ephemeral: true,
-    });
-  }
+        const members = await message.guild.members.fetch();
+        const humanMembers = members.filter(m => !m.user.bot).first(guildSettings.maxPlayers || 10);
+        
+        if (humanMembers.length < 2) {
+            return message.reply('لا يوجد عدد كافٍ من الأعضاء لبدء اللعبة.');
+        }
 
-  // Check channel permission
-  if (settings.allowedChannelId && interaction.channelId !== settings.allowedChannelId) {
-    return interaction.reply({
-      content: `This command can only be used in <#${settings.allowedChannelId}>`,
-      ephemeral: true,
-    });
-  }
+        const players = humanMembers.map(m => ({
+            id: m.id,
+            username: m.user.username,
+            avatar: m.user.displayAvatarURL({ extension: 'png' })
+        }));
 
-  if (interaction.commandName === 'roulette') {
-    await handleRouletteCommand(interaction, settings);
-  } else if (interaction.commandName === 'settings') {
-    await handleSettingsCommand(interaction);
-  } else if (interaction.commandName === 'join') {
-    await handleJoinCommand(interaction);
-  } else if (interaction.commandName === 'spin') {
-    await handleSpinCommand(interaction);
-  }
+        const embed = new EmbedBuilder()
+            .setTitle('X-Gamer Roulette')
+            .setDescription('اضغط على الزر أدناه لمشاهدة السحب المباشر!')
+            .setColor(guildSettings.color || '#ff0000')
+            .setTimestamp();
+
+        const row = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setLabel('مشاهدة الروليت')
+                    .setURL(`${process.env.DOMAIN || 'http://localhost:3000'}/view/${message.guild.id}?p=${encodeURIComponent(JSON.stringify(players))}`)
+                    .setStyle(ButtonStyle.Link)
+            );
+
+        message.channel.send({ embeds: [embed], components: [row] });
+    }
 });
 
-// ==================== COMMAND HANDLERS ====================
+// --- إعداد Passport و Discord OAuth2 ---
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
 
-async function handleRouletteCommand(interaction, settings) {
-  const guildId = interaction.guildId;
+passport.use(new DiscordStrategy({
+    clientID: process.env.CLIENT_ID,
+    clientSecret: process.env.CLIENT_SECRET,
+    callbackURL: `${process.env.DOMAIN || 'http://localhost:3000'}/auth/discord/callback`,
+    scope: ['identify', 'guilds']
+}, (accessToken, refreshToken, profile, done) => {
+    process.nextTick(() => done(null, profile));
+}));
 
-  if (activeGames.has(guildId)) {
-    return interaction.reply({
-      content: 'A roulette game is already active in this server!',
-      ephemeral: true,
-    });
-  }
+app.use(session({
+    secret: 'x-gamer-secret-key',
+    resave: false,
+    saveUninitialized: false
+}));
 
-  // Create new game
-  const gameId = `game_${guildId}_${Date.now()}`;
-  const game = {
-    gameId,
-    guildId,
-    channelId: interaction.channelId,
-    players: new Map(),
-    status: 'waiting',
-    createdAt: Date.now(),
-    settings,
-  };
+app.use(passport.initialize());
+app.use(passport.session());
+app.use(express.json());
 
-  activeGames.set(guildId, game);
+// --- مسارات الويب (Frontend) ---
 
-  // Create embed
-  const embed = new EmbedBuilder()
-    .setTitle('X-GAMER ROULETTE')
-    .setDescription('Click the button below to join the roulette game!')
-    .setColor(settings.rouletteColor)
-    .addFields(
-      { name: 'Players', value: '0', inline: true },
-      { name: 'Min Players', value: String(settings.minPlayers), inline: true },
-      { name: 'Max Players', value: String(settings.maxPlayers), inline: true },
-      { name: 'Status', value: 'Waiting for players...', inline: false }
-    )
-    .setFooter({ text: 'X-GAMER | Click Join to participate' });
+// الصفحة الرئيسية وتسجيل الدخول
+app.get('/', (req, res) => {
+    if (req.isAuthenticated()) return res.redirect('/dashboard');
+    res.send(renderPage('Home', `
+        <div class="hero-section text-center py-20">
+            <h1 class="text-6xl font-bold mb-6 animate-pulse text-red-600">X-GAMER</h1>
+            <p class="text-xl mb-10 text-gray-400">نظام الروليت الأكثر قوة واحترافية في ديسكورد</p>
+            <a href="/auth/discord" class="bg-red-600 hover:bg-red-700 text-white px-10 py-4 rounded-full font-bold transition-all transform hover:scale-110">
+                تسجيل الدخول عبر ديسكورد
+            </a>
+        </div>
+    `));
+});
 
-  const joinButton = new ButtonBuilder()
-    .setCustomId(`join_${gameId}`)
-    .setLabel('Join Game')
-    .setStyle(ButtonStyle.Danger);
+app.get('/auth/discord', passport.authenticate('discord'));
+app.get('/auth/discord/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => res.redirect('/dashboard'));
+app.get('/logout', (req, res) => { req.logout(() => res.redirect('/')); });
 
-  const spinButton = new ButtonBuilder()
-    .setCustomId(`spin_${gameId}`)
-    .setLabel('Spin The Wheel')
-    .setStyle(ButtonStyle.Primary)
-    .setDisabled(true);
+// لوحة التحكم
+app.get('/dashboard', (req, res) => {
+    if (!req.isAuthenticated()) return res.redirect('/');
+    
+    const userGuilds = req.user.guilds.filter(g => (g.permissions & 0x8) === 0x8); // السيرفرات التي يملك فيها صلاحية Admin
+    
+    let guildListHtml = userGuilds.map(g => `
+        <div class="guild-card bg-zinc-900 p-4 rounded-xl mb-4 flex items-center justify-between border-l-4 border-transparent hover:border-red-600 transition-all cursor-pointer" onclick="window.location='/dashboard/${g.id}'">
+            <div class="flex items-center">
+                <img src="${g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-12 h-12 rounded-full mr-4">
+                <span class="text-lg font-semibold">${g.name}</span>
+            </div>
+            <i class="fas fa-chevron-right text-gray-600"></i>
+        </div>
+    `).join('');
 
-  const row = new ActionRowBuilder().addComponents(joinButton, spinButton);
+    res.send(renderPage('Dashboard', `
+        <div class="flex h-screen overflow-hidden">
+            <!-- Sidebar -->
+            <div class="w-80 bg-black border-r border-zinc-800 p-6 overflow-y-auto">
+                <h2 class="text-2xl font-bold mb-8 text-red-600">X-GAMER</h2>
+                <div class="space-y-2">
+                    <p class="text-xs text-gray-500 uppercase tracking-widest mb-4">السيرفرات الخاصة بك</p>
+                    ${guildListHtml}
+                </div>
+            </div>
+            <!-- Main Content -->
+            <div class="flex-1 bg-zinc-950 p-10 overflow-y-auto">
+                <div class="flex justify-between items-center mb-10">
+                    <h1 class="text-3xl font-bold">مرحباً بك، ${req.user.username}</h1>
+                    <a href="/logout" class="text-gray-400 hover:text-white">تسجيل الخروج</a>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800">
+                        <h3 class="text-xl font-bold mb-4">إحصائيات سريعة</h3>
+                        <p class="text-gray-400">اختر سيرفر من القائمة الجانبية للبدء في تخصيص إعدادات الروليت.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `, true));
+});
 
-  const message = await interaction.reply({
-    embeds: [embed],
-    components: [row],
-    fetchReply: true,
-  });
+// إعدادات سيرفر محدد
+app.get('/dashboard/:guildID', async (req, res) => {
+    if (!req.isAuthenticated()) return res.redirect('/');
+    const guildID = req.params.guildID;
+    const guild = req.user.guilds.find(g => g.id === guildID);
+    if (!guild || (guild.permissions & 0x8) !== 0x8) return res.redirect('/dashboard');
 
-  game.messageId = message.id;
+    const settings = botSettings.guilds[guildID] || { ...botSettings };
 
-  // Store button interaction handlers
-  const filter = (i) => i.customId.startsWith(`join_${gameId}`) || i.customId.startsWith(`spin_${gameId}`);
-  const collector = message.createMessageComponentCollector({ filter, time: 300000 }); // 5 minutes
+    res.send(renderPage('Server Settings', `
+        <div class="flex h-screen overflow-hidden">
+            <!-- Sidebar (Same as dashboard) -->
+            <div class="w-80 bg-black border-r border-zinc-800 p-6 overflow-y-auto">
+                <h2 class="text-2xl font-bold mb-8 text-red-600 cursor-pointer" onclick="window.location='/dashboard'">X-GAMER</h2>
+                <div class="space-y-2">
+                    <p class="text-xs text-gray-500 uppercase tracking-widest mb-4">السيرفرات الخاصة بك</p>
+                    ${req.user.guilds.filter(g => (g.permissions & 0x8) === 0x8).map(g => `
+                        <div class="guild-card bg-zinc-900 p-4 rounded-xl mb-4 flex items-center justify-between border-l-4 ${g.id === guildID ? 'border-red-600 bg-zinc-800' : 'border-transparent'} hover:border-red-600 transition-all cursor-pointer" onclick="window.location='/dashboard/${g.id}'">
+                            <div class="flex items-center">
+                                <img src="${g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-10 h-10 rounded-full mr-3">
+                                <span class="text-sm font-semibold truncate w-32">${g.name}</span>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+            <!-- Settings Form -->
+            <div class="flex-1 bg-zinc-950 p-10 overflow-y-auto">
+                <div class="flex items-center mb-10">
+                    <img src="${guild.icon ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-16 h-16 rounded-full mr-6 border-2 border-red-600">
+                    <div>
+                        <h1 class="text-3xl font-bold">${guild.name}</h1>
+                        <p class="text-gray-400">تخصيص إعدادات الروليت</p>
+                    </div>
+                </div>
 
-  collector.on('collect', async (buttonInteraction) => {
-    if (buttonInteraction.customId.startsWith('join_')) {
-      await handlePlayerJoin(buttonInteraction, game, message);
-    } else if (buttonInteraction.customId.startsWith('spin_')) {
-      await handleGameSpin(buttonInteraction, game, message, collector);
-    }
-  });
+                <div class="max-w-4xl space-y-8">
+                    <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
+                        <h3 class="text-xl font-bold mb-6 text-red-500">الألوان والمظهر</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">لون اللعبة الأساسي</label>
+                                <input type="color" id="gameColor" value="${settings.color}" class="w-full h-12 bg-zinc-800 border-none rounded-lg cursor-pointer">
+                            </div>
+                        </div>
+                    </div>
 
-  collector.on('end', () => {
-    activeGames.delete(guildId);
-  });
+                    <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
+                        <h3 class="text-xl font-bold mb-6 text-red-500">إعدادات اللعبة</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">عدد اللاعبين الكامل</label>
+                                <input type="number" id="maxPlayers" value="${settings.maxPlayers}" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">روم اللعبة (ID)</label>
+                                <input type="text" id="targetChannel" value="${settings.targetChannel}" placeholder="أدخل ID الروم هنا" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">رتبة التحكم (ID)</label>
+                                <input type="text" id="allowedRole" value="${settings.allowedRole}" placeholder="أدخل ID الرتبة هنا" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
+                            </div>
+                        </div>
+                    </div>
+
+                    <button onclick="saveSettings('${guildID}')" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-4 rounded-xl transition-all transform hover:scale-[1.02] shadow-lg shadow-red-900/20">
+                        حفظ الإعدادات النارية
+                    </button>
+                </div>
+            </div>
+        </div>
+        <script>
+            async function saveSettings(guildID) {
+                const data = {
+                    color: document.getElementById('gameColor').value,
+                    maxPlayers: document.getElementById('maxPlayers').value,
+                    targetChannel: document.getElementById('targetChannel').value,
+                    allowedRole: document.getElementById('allowedRole').value
+                };
+                const res = await fetch('/api/settings/' + guildID, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                if(res.ok) alert('تم الحفظ بنجاح يوحش!');
+                else alert('حدث خطأ أثناء الحفظ.');
+            }
+        </script>
+    `, true));
+});
+
+// API لحفظ الإعدادات
+app.post('/api/settings/:guildID', (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).send('Unauthorized');
+    const guildID = req.params.guildID;
+    botSettings.guilds[guildID] = {
+        color: req.body.color,
+        maxPlayers: parseInt(req.body.maxPlayers),
+        targetChannel: req.body.targetChannel,
+        allowedRole: req.body.allowedRole
+    };
+    res.sendStatus(200);
+});
+
+// عرض الروليت (Slider)
+app.get('/view/:guildID', (req, res) => {
+    const players = JSON.parse(decodeURIComponent(req.query.p || '[]'));
+    const guildID = req.params.guildID;
+    const settings = botSettings.guilds[guildID] || botSettings;
+    const color = settings.color || '#ff0000';
+
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>X-Gamer Roulette</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+                body { background: #000; color: white; font-family: sans-serif; overflow: hidden; }
+                .roulette-container { position: relative; width: 100%; height: 300px; margin-top: 100px; overflow: hidden; border-top: 2px solid ${color}; border-bottom: 2px solid ${color}; background: rgba(0,0,0,0.5); }
+                .slider { display: flex; position: absolute; left: 0; transition: transform 8s cubic-bezier(0.1, 0, 0.1, 1); }
+                .card { min-width: 200px; height: 250px; margin: 25px 10px; background: #111; border: 2px solid #222; border-radius: 15px; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: all 0.3s; }
+                .card.active { border-color: ${color}; box-shadow: 0 0 20px ${color}; transform: scale(1.1); }
+                .pointer { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 4px; height: 100%; background: ${color}; z-index: 10; box-shadow: 0 0 15px ${color}; }
+                .pointer::after { content: ''; position: absolute; top: -10px; left: -8px; border-left: 10px solid transparent; border-right: 10px solid transparent; border-top: 15px solid ${color}; }
+                .avatar { width: 100px; height: 100px; border-radius: 50%; border: 3px solid ${color}; margin-bottom: 15px; }
+                .fire-bg { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; background: radial-gradient(circle at center, ${color}33 0%, #000 70%); }
+            </style>
+        </head>
+        <body>
+            <div class="fire-bg"></div>
+            <div class="text-center mt-10">
+                <h1 class="text-5xl font-bold" style="color: ${color}; text-shadow: 0 0 10px ${color}">X-GAMER ROULETTE</h1>
+            </div>
+
+            <div class="roulette-container">
+                <div class="pointer"></div>
+                <div class="slider" id="slider"></div>
+            </div>
+
+            <div class="text-center mt-10">
+                <button id="spinBtn" class="bg-red-600 text-white px-12 py-4 rounded-full text-2xl font-bold hover:scale-110 transition-all shadow-xl">ابدأ السحب يوحش</button>
+                <h2 id="winner" class="text-4xl font-bold mt-10 hidden animate-bounce"></h2>
+            </div>
+
+            <script>
+                const players = ${JSON.stringify(players)};
+                const slider = document.getElementById('slider');
+                const spinBtn = document.getElementById('spinBtn');
+                const winnerText = document.getElementById('winner');
+                
+                // تكرار اللاعبين لجعل السلايدر يبدو طويلاً
+                const items = [];
+                for(let i=0; i<10; i++) items.push(...players);
+                
+                items.forEach((p, index) => {
+                    const div = document.createElement('div');
+                    div.className = 'card';
+                    div.innerHTML = \`
+                        <img src="\${p.avatar}" class="avatar">
+                        <span class="text-xl font-bold">\${p.username}</span>
+                    \`;
+                    slider.appendChild(div);
+                });
+
+                spinBtn.onclick = () => {
+                    spinBtn.disabled = true;
+                    spinBtn.style.opacity = '0.5';
+                    const cardWidth = 220;
+                    const totalItems = items.length;
+                    const winningIndex = Math.floor(Math.random() * players.length) + (totalItems - players.length * 2);
+                    const offset = (winningIndex * cardWidth) - (window.innerWidth / 2) + (cardWidth / 2);
+                    
+                    slider.style.transform = \`translateX(\${offset}px)\`;
+                    
+                    setTimeout(() => {
+                        const winner = items[winningIndex];
+                        winnerText.innerText = 'الفائز هو: ' + winner.username;
+                        winnerText.classList.remove('hidden');
+                        winnerText.style.color = '${color}';
+                        
+                        // تأثيرات نارية عند الفوز
+                        confetti(); 
+                    }, 8500);
+                };
+                
+                function confetti() {
+                    // هنا يمكن إضافة تأثيرات بصرية إضافية
+                }
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// دالة مساعدة لرندرة الصفحات
+function renderPage(title, content, noNav = false) {
+    return `
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>${title} | X-Gamer</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap');
+                body { background-color: #050505; color: #fff; font-family: 'Cairo', sans-serif; }
+                .animate-fire { animation: fire 2s infinite alternate; }
+                @keyframes fire { from { text-shadow: 0 0 10px #ff0000, 0 0 20px #ff0000; } to { text-shadow: 0 0 20px #ff4500, 0 0 40px #ff4500; } }
+                .guild-card:hover { transform: translateX(-5px); }
+                ::-webkit-scrollbar { width: 5px; }
+                ::-webkit-scrollbar-track { background: #000; }
+                ::-webkit-scrollbar-thumb { background: #ff0000; border-radius: 10px; }
+            </style>
+        </head>
+        <body>
+            ${content}
+        </body>
+        </html>
+    `;
 }
 
-async function handlePlayerJoin(interaction, game, message) {
-  const userId = interaction.user.id;
-  const userName = interaction.user.username;
-
-  if (game.players.has(userId)) {
-    return interaction.reply({
-      content: 'You are already in this game!',
-      ephemeral: true,
-    });
-  }
-
-  if (game.players.size >= game.settings.maxPlayers) {
-    return interaction.reply({
-      content: 'The game is full!',
-      ephemeral: true,
-    });
-  }
-
-  game.players.set(userId, {
-    id: userId,
-    name: userName,
-    avatar: interaction.user.displayAvatarURL({ size: 256 }),
-  });
-
-  await interaction.reply({
-    content: `${userName} joined the game! (${game.players.size}/${game.settings.maxPlayers})`,
-    ephemeral: true,
-  });
-
-  // Update message
-  await updateGameMessage(message, game);
-
-  // Enable spin button if minimum players reached
-  if (game.players.size >= game.settings.minPlayers) {
-    const spinButton = message.components[0].components[1];
-    spinButton.setDisabled(false);
-    await message.edit({ components: message.components });
-  }
-}
-
-async function handleGameSpin(interaction, game, message, collector) {
-  if (game.players.size < game.settings.minPlayers) {
-    return interaction.reply({
-      content: `Need at least ${game.settings.minPlayers} players to spin!`,
-      ephemeral: true,
-    });
-  }
-
-  if (game.status === 'spinning') {
-    return interaction.reply({
-      content: 'The wheel is already spinning!',
-      ephemeral: true,
-    });
-  }
-
-  game.status = 'spinning';
-
-  // Disable buttons
-  const buttons = message.components[0].components;
-  buttons.forEach((btn) => btn.setDisabled(true));
-  await message.edit({ components: message.components });
-
-  await interaction.reply({
-    content: 'The wheel is spinning...',
-    ephemeral: true,
-  });
-
-  // Simulate spinning
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-  // Select winner
-  const playersArray = Array.from(game.players.values());
-  const winner = playersArray[Math.floor(Math.random() * playersArray.length)];
-
-  // Create winner embed
-  const winnerEmbed = new EmbedBuilder()
-    .setTitle('WINNER')
-    .setDescription(`${winner.name} won the roulette!`)
-    .setColor(game.settings.rouletteColor)
-    .setThumbnail(winner.avatar)
-    .setFooter({ text: 'X-GAMER | Congratulations!' });
-
-  await message.reply({
-    embeds: [winnerEmbed],
-  });
-
-  // End game
-  game.status = 'finished';
-  collector.stop();
-}
-
-async function handleSettingsCommand(interaction) {
-  const guildId = interaction.guildId;
-  const subcommand = interaction.options.getSubcommand();
-
-  if (subcommand === 'color') {
-    const color = interaction.options.getString('color');
-    if (!serverSettings.has(guildId)) {
-      serverSettings.set(guildId, { ...DEFAULT_SETTINGS });
-    }
-    serverSettings.get(guildId).rouletteColor = color;
-
-    return interaction.reply({
-      content: `Roulette color set to ${color}`,
-      ephemeral: true,
-    });
-  } else if (subcommand === 'maxplayers') {
-    const maxPlayers = interaction.options.getInteger('count');
-    if (!serverSettings.has(guildId)) {
-      serverSettings.set(guildId, { ...DEFAULT_SETTINGS });
-    }
-    serverSettings.get(guildId).maxPlayers = maxPlayers;
-
-    return interaction.reply({
-      content: `Max players set to ${maxPlayers}`,
-      ephemeral: true,
-    });
-  } else if (subcommand === 'role') {
-    const role = interaction.options.getRole('role');
-    if (!serverSettings.has(guildId)) {
-      serverSettings.set(guildId, { ...DEFAULT_SETTINGS });
-    }
-    serverSettings.get(guildId).allowedRoleId = role.id;
-
-    return interaction.reply({
-      content: `Only users with ${role.name} role can use roulette commands`,
-      ephemeral: true,
-    });
-  } else if (subcommand === 'channel') {
-    const channel = interaction.options.getChannel('channel');
-    if (!serverSettings.has(guildId)) {
-      serverSettings.set(guildId, { ...DEFAULT_SETTINGS });
-    }
-    serverSettings.get(guildId).allowedChannelId = channel.id;
-
-    return interaction.reply({
-      content: `Roulette commands can only be used in ${channel.name}`,
-      ephemeral: true,
-    });
-  }
-}
-
-async function handleJoinCommand(interaction) {
-  const guildId = interaction.guildId;
-  const game = activeGames.get(guildId);
-
-  if (!game) {
-    return interaction.reply({
-      content: 'No active roulette game in this server!',
-      ephemeral: true,
-    });
-  }
-
-  const userId = interaction.user.id;
-  if (game.players.has(userId)) {
-    return interaction.reply({
-      content: 'You are already in this game!',
-      ephemeral: true,
-    });
-  }
-
-  if (game.players.size >= game.settings.maxPlayers) {
-    return interaction.reply({
-      content: 'The game is full!',
-      ephemeral: true,
-    });
-  }
-
-  game.players.set(userId, {
-    id: userId,
-    name: interaction.user.username,
-    avatar: interaction.user.displayAvatarURL({ size: 256 }),
-  });
-
-  await interaction.reply({
-    content: `You joined the game! (${game.players.size}/${game.settings.maxPlayers})`,
-    ephemeral: true,
-  });
-}
-
-async function handleSpinCommand(interaction) {
-  const guildId = interaction.guildId;
-  const game = activeGames.get(guildId);
-
-  if (!game) {
-    return interaction.reply({
-      content: 'No active roulette game in this server!',
-      ephemeral: true,
-    });
-  }
-
-  if (game.players.size < game.settings.minPlayers) {
-    return interaction.reply({
-      content: `Need at least ${game.settings.minPlayers} players to spin!`,
-      ephemeral: true,
-    });
-  }
-
-  if (game.status === 'spinning') {
-    return interaction.reply({
-      content: 'The wheel is already spinning!',
-      ephemeral: true,
-    });
-  }
-
-  game.status = 'spinning';
-  await interaction.reply({
-    content: 'The wheel is spinning...',
-    ephemeral: true,
-  });
-
-  // Simulate spinning
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-  // Select winner
-  const playersArray = Array.from(game.players.values());
-  const winner = playersArray[Math.floor(Math.random() * playersArray.length)];
-
-  const winnerEmbed = new EmbedBuilder()
-    .setTitle('WINNER')
-    .setDescription(`${winner.name} won the roulette!`)
-    .setColor(game.settings.rouletteColor)
-    .setThumbnail(winner.avatar)
-    .setFooter({ text: 'X-GAMER | Congratulations!' });
-
-  await interaction.followUp({
-    embeds: [winnerEmbed],
-  });
-
-  game.status = 'finished';
-  activeGames.delete(guildId);
-}
-
-async function updateGameMessage(message, game) {
-  const embed = new EmbedBuilder()
-    .setTitle('X-GAMER ROULETTE')
-    .setDescription('Click the button below to join the roulette game!')
-    .setColor(game.settings.rouletteColor)
-    .addFields(
-      { name: 'Players', value: String(game.players.size), inline: true },
-      { name: 'Min Players', value: String(game.settings.minPlayers), inline: true },
-      { name: 'Max Players', value: String(game.settings.maxPlayers), inline: true },
-      {
-        name: 'Participants',
-        value: Array.from(game.players.values())
-          .map((p) => p.name)
-          .join(', ') || 'None yet',
-        inline: false,
-      }
-    )
-    .setFooter({ text: 'X-GAMER | Click Join to participate' });
-
-  await message.edit({ embeds: [embed] });
-}
-
-// ==================== REGISTER COMMANDS ====================
-
-async function registerCommands() {
-  const commands = [
-    new SlashCommandBuilder()
-      .setName('roulette')
-      .setDescription('Start a new X-Gamer roulette game'),
-
-    new SlashCommandBuilder()
-      .setName('join')
-      .setDescription('Join the active roulette game'),
-
-    new SlashCommandBuilder()
-      .setName('spin')
-      .setDescription('Spin the roulette wheel'),
-
-    new SlashCommandBuilder()
-      .setName('settings')
-      .setDescription('Configure X-Gamer settings')
-      .addSubcommand((sub) =>
-        sub
-          .setName('color')
-          .setDescription('Set roulette color')
-          .addStringOption((opt) =>
-            opt
-              .setName('color')
-              .setDescription('Hex color code (e.g., #FF0000)')
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('maxplayers')
-          .setDescription('Set maximum players')
-          .addIntegerOption((opt) =>
-            opt
-              .setName('count')
-              .setDescription('Maximum number of players (2-100)')
-              .setRequired(true)
-              .setMinValue(2)
-              .setMaxValue(100)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('role')
-          .setDescription('Set required role')
-          .addRoleOption((opt) =>
-            opt
-              .setName('role')
-              .setDescription('Role that can use roulette')
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('channel')
-          .setDescription('Set allowed channel')
-          .addChannelOption((opt) =>
-            opt
-              .setName('channel')
-              .setDescription('Channel where roulette can be used')
-              .setRequired(true)
-              .addChannelTypes(ChannelType.GuildText)
-          )
-      ),
-  ];
-
-  try {
-    console.log('[X-GAMER] Registering slash commands...');
-    await client.application.commands.set(commands);
-    console.log('[X-GAMER] Slash commands registered successfully!');
-  } catch (error) {
-    console.error('[X-GAMER] Error registering commands:', error);
-  }
-}
-
-// ==================== LOGIN ====================
-
-client.once('ready', registerCommands);
-
-client.login(process.env.DISCORD_TOKEN);
+// تشغيل السيرفر والبوت
+client.login(process.env.TOKEN).catch(err => console.error('Discord Login Failed:', err));
+app.listen(port, () => console.log(`Dashboard running at http://localhost:${port}`));
