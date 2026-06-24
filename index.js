@@ -3,19 +3,20 @@ const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config();
 
 // ==================== CONFIG ====================
 const PORT = process.env.PORT || 3000;
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || 'YOUR_CLIENT_ID';
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI || `http://localhost:${PORT}/callback`;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const RESULTS_FILE = path.join(__dirname, 'detected_usernames.json');
 
 // ==================== STATE ====================
+let activeSearches = {}; // { guildId: { channelId, isSearching, results } }
+let userSessions = {}; // { sessionId: { userId, accessToken, createdAt } }
 let detectedUsernames = [];
-let isSearching = false;
-let currentSession = null;
-let userSessions = {};
 
 // Load results from file
 if (fs.existsSync(RESULTS_FILE)) {
@@ -25,7 +26,7 @@ if (fs.existsSync(RESULTS_FILE)) {
 // ==================== EXPRESS APP ====================
 const app = express();
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.urlencoded({ extended: true }));
 
 // ==================== DISCORD OAUTH ====================
 app.get('/login', (req, res) => {
@@ -69,104 +70,135 @@ app.get('/callback', async (req, res) => {
 });
 
 // ==================== API ENDPOINTS ====================
-app.post('/api/start-search', (req, res) => {
-  const { botToken, serverId, channelId, sessionId } = req.body;
-
-  if (!botToken || !serverId || !channelId) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  isSearching = true;
-  currentSession = { botToken, serverId, channelId, sessionId };
-  detectedUsernames = [];
-  saveResults();
-
-  startUsernameSearch(botToken, serverId, channelId);
-
-  res.json({ success: true, message: 'Search started' });
-});
-
-app.post('/api/stop-search', (req, res) => {
-  const { sessionId } = req.body;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  isSearching = false;
-  res.json({ success: true, message: 'Search stopped' });
-});
-
-app.get('/api/results', (req, res) => {
+app.get('/api/guilds', async (req, res) => {
   const { sessionId } = req.query;
 
   if (!userSessions[sessionId]) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const stats = {
-    total: detectedUsernames.length,
-    threeChar: detectedUsernames.filter(u => u.length === 3).length,
-    twoChar: detectedUsernames.filter(u => u.length === 2).length,
-    oneChar: detectedUsernames.filter(u => u.length === 1).length,
-  };
+  try {
+    const accessToken = userSessions[sessionId].accessToken;
+    const response = await axios.get('https://discord.com/api/users/@me/guilds', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
 
-  res.json({
-    stats,
-    usernames: detectedUsernames.map((u, i) => ({
-      id: i,
-      username: u,
-      length: u.length,
-      detectedAt: new Date().toISOString(),
-    })),
-  });
+    // Filter only guilds where user is admin
+    const adminGuilds = response.data.filter(guild => {
+      const permissions = BigInt(guild.permissions);
+      return (permissions & BigInt(8)) === BigInt(8); // ADMINISTRATOR permission
+    });
+
+    res.json(adminGuilds);
+  } catch (error) {
+    console.error('Error fetching guilds:', error);
+    res.status(500).json({ error: 'Failed to fetch guilds' });
+  }
 });
 
-app.post('/api/clear-results', (req, res) => {
-  const { sessionId } = req.body;
+app.get('/api/channels/:guildId', async (req, res) => {
+  const { guildId } = req.params;
+  const { sessionId } = req.query;
 
   if (!userSessions[sessionId]) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  detectedUsernames = [];
-  saveResults();
-  res.json({ success: true, message: 'Results cleared' });
-});
-
-// ==================== DISCORD BOT ====================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages,
-  ],
-});
-
-client.on('ready', () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
-});
-
-client.on('error', error => {
-  console.error('Discord bot error:', error);
-});
-
-// ==================== USERNAME SEARCH ENGINE ====================
-async function startUsernameSearch(botToken, serverId, channelId) {
   try {
     const client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
     });
 
-    await client.login(botToken);
+    await client.login(DISCORD_BOT_TOKEN);
 
     client.on('ready', async () => {
       try {
-        const guild = await client.guilds.fetch(serverId);
+        const guild = await client.guilds.fetch(guildId);
+        const channels = await guild.channels.fetch();
+
+        const textChannels = channels
+          .filter(ch => ch.type === ChannelType.GuildText)
+          .map(ch => ({ id: ch.id, name: ch.name }));
+
+        res.json(textChannels);
+        client.destroy();
+      } catch (error) {
+        console.error('Error fetching channels:', error);
+        res.status(500).json({ error: 'Failed to fetch channels' });
+        client.destroy();
+      }
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to fetch channels' });
+  }
+});
+
+app.post('/api/search/start', (req, res) => {
+  const { guildId, channelId, sessionId } = req.body;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (!guildId || !channelId) {
+    return res.status(400).json({ error: 'Missing guildId or channelId' });
+  }
+
+  activeSearches[guildId] = {
+    channelId,
+    isSearching: true,
+    results: [],
+  };
+
+  // Start search in background
+  startUsernameSearch(guildId, channelId);
+
+  res.json({ success: true, message: 'Search started' });
+});
+
+app.post('/api/search/stop', (req, res) => {
+  const { guildId, sessionId } = req.body;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (activeSearches[guildId]) {
+    activeSearches[guildId].isSearching = false;
+  }
+
+  res.json({ success: true, message: 'Search stopped' });
+});
+
+app.get('/api/search/status/:guildId', (req, res) => {
+  const { guildId } = req.params;
+  const { sessionId } = req.query;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const search = activeSearches[guildId];
+  res.json({
+    isSearching: search?.isSearching || false,
+    results: search?.results || [],
+    total: detectedUsernames.length,
+  });
+});
+
+// ==================== DISCORD BOT SEARCH ====================
+async function startUsernameSearch(guildId, channelId) {
+  try {
+    const client = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+    });
+
+    await client.login(DISCORD_BOT_TOKEN);
+
+    client.on('ready', async () => {
+      try {
+        const guild = await client.guilds.fetch(guildId);
         const channel = await guild.channels.fetch(channelId);
 
         if (!channel || channel.type !== ChannelType.GuildText) {
@@ -175,13 +207,16 @@ async function startUsernameSearch(botToken, serverId, channelId) {
           return;
         }
 
-        // Simulate username search (3-char and 2-char usernames)
-        const searchResults = generateThreeCharUsernames(100);
+        // Generate usernames
+        const usernames = generateThreeCharUsernames(50);
 
-        for (const username of searchResults) {
-          if (!isSearching) break;
+        for (const username of usernames) {
+          if (!activeSearches[guildId]?.isSearching) break;
 
           detectedUsernames.push(username);
+          if (activeSearches[guildId]) {
+            activeSearches[guildId].results.push(username);
+          }
           saveResults();
 
           // Send to Discord channel
@@ -191,12 +226,20 @@ async function startUsernameSearch(botToken, serverId, channelId) {
             console.error('Failed to send message:', err);
           }
 
-          // Small delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 500));
+          // Delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 300));
         }
 
-        isSearching = false;
-        await channel.send('🏁 **Search completed!**');
+        if (activeSearches[guildId]) {
+          activeSearches[guildId].isSearching = false;
+        }
+
+        try {
+          await channel.send('🏁 **Search completed!**');
+        } catch (err) {
+          console.error('Failed to send completion message:', err);
+        }
+
         client.destroy();
       } catch (error) {
         console.error('Search error:', error);
@@ -212,7 +255,6 @@ function generateThreeCharUsernames(count) {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   const usernames = [];
 
-  // Generate 3-char usernames
   for (let i = 0; i < count * 0.6; i++) {
     let username = '';
     for (let j = 0; j < 3; j++) {
@@ -223,7 +265,6 @@ function generateThreeCharUsernames(count) {
     }
   }
 
-  // Generate 2-char usernames
   for (let i = 0; i < count * 0.3; i++) {
     let username = '';
     for (let j = 0; j < 2; j++) {
@@ -234,7 +275,6 @@ function generateThreeCharUsernames(count) {
     }
   }
 
-  // Generate 1-char usernames
   for (let i = 0; i < count * 0.1; i++) {
     const username = chars[Math.floor(Math.random() * chars.length)];
     if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
@@ -277,7 +317,7 @@ app.get('/', (req, res) => {
     }
 
     .container {
-      max-width: 1200px;
+      max-width: 1400px;
       margin: 0 auto;
       padding: 40px 20px;
     }
@@ -338,24 +378,54 @@ app.get('/', (req, res) => {
       transform: scale(0.98);
     }
 
-    .session-info {
-      font-size: 12px;
-      color: #888888;
-    }
-
-    /* CONFIGURATION SECTION */
-    .section {
+    /* GUILDS GRID */
+    .guilds-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 20px;
       margin-bottom: 40px;
     }
 
-    .section-title {
+    .guild-card {
+      border: 2px solid #ffffff;
+      padding: 20px;
+      cursor: pointer;
+      transition: all 0.3s;
+      background-color: #0a0a0a;
+    }
+
+    .guild-card:hover {
+      background-color: #1a1a1a;
+      border-color: #ff0000;
+    }
+
+    .guild-name {
+      font-size: 16px;
+      font-weight: bold;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+    }
+
+    .guild-id {
+      font-size: 11px;
+      color: #888888;
+      margin-bottom: 15px;
+    }
+
+    /* SEARCH CARD */
+    .search-card {
+      border: 2px solid #ffffff;
+      padding: 30px;
+      background-color: #0a0a0a;
+      margin-bottom: 40px;
+    }
+
+    .search-card-title {
       font-size: 24px;
       font-weight: 900;
       letter-spacing: 3px;
       margin-bottom: 20px;
       text-transform: uppercase;
-      border-bottom: 2px solid #ffffff;
-      padding-bottom: 10px;
     }
 
     .form-group {
@@ -371,8 +441,7 @@ app.get('/', (req, res) => {
       text-transform: uppercase;
     }
 
-    input[type="text"],
-    input[type="password"] {
+    select {
       width: 100%;
       padding: 12px;
       background-color: #1a1a1a;
@@ -383,8 +452,7 @@ app.get('/', (req, res) => {
       letter-spacing: 1px;
     }
 
-    input[type="text"]:focus,
-    input[type="password"]:focus {
+    select:focus {
       outline: none;
       background-color: #2a2a2a;
       border-color: #ff0000;
@@ -422,11 +490,11 @@ app.get('/', (req, res) => {
     }
 
     button.stop {
-      background-color: #333333;
-      color: #ff0000;
+      background-color: #00aa00;
+      color: #000000;
     }
 
-    button.stop:hover {
+    button.stop.active {
       background-color: #ff0000;
       color: #ffffff;
     }
@@ -436,72 +504,17 @@ app.get('/', (req, res) => {
       cursor: not-allowed;
     }
 
-    /* STATISTICS */
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 20px;
-      margin-bottom: 40px;
-    }
-
-    .stat-box {
-      border: 2px solid #ffffff;
-      padding: 20px;
-      text-align: center;
-    }
-
-    .stat-number {
-      font-size: 48px;
-      font-weight: 900;
-      color: #ff0000;
-      margin-bottom: 10px;
-    }
-
-    .stat-label {
+    /* STATUS */
+    .status {
       font-size: 12px;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-    }
-
-    /* RESULTS TABLE */
-    .results-section {
-      margin-top: 40px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      border: 2px solid #ffffff;
-    }
-
-    thead {
+      margin-top: 15px;
+      padding: 10px;
       background-color: #1a1a1a;
-      border-bottom: 2px solid #ff0000;
+      border-left: 3px solid #ff0000;
     }
 
-    th {
-      padding: 15px;
-      text-align: right;
-      font-size: 12px;
-      font-weight: bold;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-    }
-
-    td {
-      padding: 12px 15px;
-      border-bottom: 1px solid #333333;
-      font-size: 13px;
-    }
-
-    tr:hover {
-      background-color: #1a1a1a;
-    }
-
-    .username-cell {
-      font-family: 'Courier New', monospace;
-      color: #ff0000;
-      font-weight: bold;
+    .status.active {
+      border-left-color: #00ff00;
     }
 
     .loading {
@@ -524,26 +537,25 @@ app.get('/', (req, res) => {
       to { transform: rotate(360deg); }
     }
 
-    .error {
-      background-color: #ff0000;
-      color: #000000;
-      padding: 15px;
-      margin-bottom: 20px;
-      border: 2px solid #ffffff;
-      font-weight: bold;
-    }
-
-    .success {
-      background-color: #00ff00;
-      color: #000000;
-      padding: 15px;
-      margin-bottom: 20px;
-      border: 2px solid #ffffff;
-      font-weight: bold;
-    }
-
     .hidden {
       display: none;
+    }
+
+    .message {
+      padding: 15px;
+      margin-bottom: 20px;
+      border: 2px solid #ffffff;
+      font-weight: bold;
+    }
+
+    .message.error {
+      background-color: #ff0000;
+      color: #000000;
+    }
+
+    .message.success {
+      background-color: #00ff00;
+      color: #000000;
     }
   </style>
 </head>
@@ -564,63 +576,32 @@ app.get('/', (req, res) => {
         </a>
       </div>
     ` : `
-      <div class="session-info">
-        Session ID: <code>${sessionId.substring(0, 20)}...</code>
-      </div>
-
       <div id="message"></div>
 
-      <div class="section">
-        <div class="section-title">CONFIGURATION</div>
+      <div class="search-card" id="searchCard" style="display: none;">
+        <div class="search-card-title" id="selectedGuildName"></div>
         
         <div class="form-group">
-          <label>BOT TOKEN</label>
-          <input type="password" id="botToken" placeholder="أدخل توكن البوت">
-        </div>
-
-        <div class="form-group">
-          <label>SERVER ID</label>
-          <input type="text" id="serverId" placeholder="معرف السيرفر">
-        </div>
-
-        <div class="form-group">
-          <label>CHANNEL ID</label>
-          <input type="text" id="channelId" placeholder="معرف الروم">
+          <label>SELECT CHANNEL</label>
+          <select id="channelSelect">
+            <option value="">-- اختر روم --</option>
+          </select>
         </div>
 
         <div class="button-group">
           <button id="startBtn" onclick="startSearch()">▶ START SEARCH</button>
           <button id="stopBtn" class="stop" onclick="stopSearch()" disabled>⏹ STOP SEARCH</button>
-          <button onclick="clearResults()">🗑 CLEAR RESULTS</button>
+        </div>
+
+        <div class="status" id="status">
+          <span id="statusText">جاهز للبحث</span>
         </div>
       </div>
 
-      <div class="section">
-        <div class="section-title">STATISTICS</div>
-        <div class="stats-grid">
-          <div class="stat-box">
-            <div class="stat-number" id="totalStat">0</div>
-            <div class="stat-label">TOTAL FOUND</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-number" id="threeCharStat">0</div>
-            <div class="stat-label">3-CHARACTER</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-number" id="twoCharStat">0</div>
-            <div class="stat-label">2-CHARACTER</div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-number" id="oneCharStat">0</div>
-            <div class="stat-label">1-CHARACTER</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="results-section">
-        <div class="section-title">DETECTED USERNAMES</div>
-        <div id="resultsContainer">
-          <div class="loading">جاري تحميل النتائج...</div>
+      <div class="guilds-grid" id="guildsGrid">
+        <div class="loading">
+          <div class="spinner"></div>
+          <p>جاري تحميل السيرفرات...</p>
         </div>
       </div>
     `}
@@ -628,32 +609,95 @@ app.get('/', (req, res) => {
 
   <script>
     const sessionId = new URLSearchParams(window.location.search).get('session');
+    let currentGuild = null;
+
+    async function loadGuilds() {
+      try {
+        const response = await fetch(\`/api/guilds?sessionId=\${sessionId}\`);
+        const guilds = await response.json();
+
+        let html = '';
+        guilds.forEach(guild => {
+          html += \`
+            <div class="guild-card" onclick="selectGuild('\${guild.id}', '\${guild.name}')">
+              <div class="guild-name">\${guild.name}</div>
+              <div class="guild-id">ID: \${guild.id}</div>
+              <div style="font-size: 11px; color: #666;">اضغط للتحديد</div>
+            </div>
+          \`;
+        });
+
+        document.getElementById('guildsGrid').innerHTML = html;
+      } catch (error) {
+        console.error('Error loading guilds:', error);
+        showMessage('خطأ في تحميل السيرفرات', 'error');
+      }
+    }
+
+    async function selectGuild(guildId, guildName) {
+      currentGuild = { id: guildId, name: guildName };
+      document.getElementById('selectedGuildName').textContent = guildName;
+      document.getElementById('searchCard').style.display = 'block';
+      document.getElementById('guildsGrid').style.display = 'none';
+
+      // Load channels
+      try {
+        const response = await fetch(\`/api/channels/\${guildId}?sessionId=\${sessionId}\`);
+        const channels = await response.json();
+
+        let html = '<option value="">-- اختر روم --</option>';
+        channels.forEach(ch => {
+          html += \`<option value="\${ch.id}">\${ch.name}</option>\`;
+        });
+
+        document.getElementById('channelSelect').innerHTML = html;
+      } catch (error) {
+        console.error('Error loading channels:', error);
+        showMessage('خطأ في تحميل الرومات', 'error');
+      }
+    }
 
     async function startSearch() {
-      const botToken = document.getElementById('botToken').value;
-      const serverId = document.getElementById('serverId').value;
-      const channelId = document.getElementById('channelId').value;
+      const channelId = document.getElementById('channelSelect').value;
 
-      if (!botToken || !serverId || !channelId) {
-        showMessage('الرجاء ملء جميع الحقول', 'error');
+      if (!channelId) {
+        showMessage('الرجاء اختيار روم', 'error');
         return;
       }
 
       try {
-        const response = await fetch('/api/start-search', {
+        const response = await fetch('/api/search/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ botToken, serverId, channelId, sessionId }),
+          body: JSON.stringify({
+            guildId: currentGuild.id,
+            channelId,
+            sessionId,
+          }),
         });
 
         if (response.ok) {
           showMessage('✅ تم بدء البحث', 'success');
           document.getElementById('startBtn').disabled = true;
           document.getElementById('stopBtn').disabled = false;
-          loadResults();
-          setInterval(loadResults, 2000);
-        } else {
-          showMessage('❌ خطأ في بدء البحث', 'error');
+          document.getElementById('status').classList.add('active');
+          document.getElementById('statusText').textContent = '🔴 البحث جاري...';
+
+          // Update status every 2 seconds
+          const interval = setInterval(async () => {
+            const statusResponse = await fetch(\`/api/search/status/\${currentGuild.id}?sessionId=\${sessionId}\`);
+            const status = await statusResponse.json();
+
+            if (!status.isSearching) {
+              clearInterval(interval);
+              document.getElementById('startBtn').disabled = false;
+              document.getElementById('stopBtn').disabled = true;
+              document.getElementById('status').classList.remove('active');
+              document.getElementById('statusText').textContent = '✅ البحث انتهى';
+            } else {
+              document.getElementById('statusText').textContent = \`🔴 البحث جاري... (\${status.results.length} يوزرنيم)\`;
+            }
+          }, 2000);
         }
       } catch (error) {
         showMessage('❌ خطأ: ' + error.message, 'error');
@@ -662,76 +706,36 @@ app.get('/', (req, res) => {
 
     async function stopSearch() {
       try {
-        const response = await fetch('/api/stop-search', {
+        const response = await fetch('/api/search/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId }),
+          body: JSON.stringify({
+            guildId: currentGuild.id,
+            sessionId,
+          }),
         });
 
         if (response.ok) {
           showMessage('✅ تم إيقاف البحث', 'success');
           document.getElementById('startBtn').disabled = false;
           document.getElementById('stopBtn').disabled = true;
+          document.getElementById('status').classList.remove('active');
+          document.getElementById('statusText').textContent = '⏹️ البحث موقوف';
         }
       } catch (error) {
         showMessage('❌ خطأ: ' + error.message, 'error');
-      }
-    }
-
-    async function clearResults() {
-      try {
-        const response = await fetch('/api/clear-results', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId }),
-        });
-
-        if (response.ok) {
-          showMessage('✅ تم مسح النتائج', 'success');
-          loadResults();
-        }
-      } catch (error) {
-        showMessage('❌ خطأ: ' + error.message, 'error');
-      }
-    }
-
-    async function loadResults() {
-      try {
-        const response = await fetch(\`/api/results?sessionId=\${sessionId}\`);
-        const data = await response.json();
-
-        document.getElementById('totalStat').textContent = data.stats.total;
-        document.getElementById('threeCharStat').textContent = data.stats.threeChar;
-        document.getElementById('twoCharStat').textContent = data.stats.twoChar;
-        document.getElementById('oneCharStat').textContent = data.stats.oneChar;
-
-        let html = '<table><thead><tr><th>USERNAME</th><th>LENGTH</th><th>DETECTED AT</th></tr></thead><tbody>';
-        
-        if (data.usernames.length === 0) {
-          html += '<tr><td colspan="3" style="text-align: center; color: #888;">لا توجد نتائج</td></tr>';
-        } else {
-          data.usernames.forEach(u => {
-            html += \`<tr><td class="username-cell">\${u.username}</td><td>\${u.length}</td><td>\${new Date(u.detectedAt).toLocaleString('ar-SA')}</td></tr>\`;
-          });
-        }
-        
-        html += '</tbody></table>';
-        document.getElementById('resultsContainer').innerHTML = html;
-      } catch (error) {
-        console.error('Error loading results:', error);
       }
     }
 
     function showMessage(text, type) {
       const msgDiv = document.getElementById('message');
-      msgDiv.innerHTML = \`<div class="\${type}">\${text}</div>\`;
+      msgDiv.innerHTML = \`<div class="message \${type}">\${text}</div>\`;
       setTimeout(() => { msgDiv.innerHTML = ''; }, 5000);
     }
 
-    // Load results on page load
+    // Load guilds on page load
     if (sessionId) {
-      loadResults();
-      setInterval(loadResults, 3000);
+      loadGuilds();
     }
   </script>
 </body>
