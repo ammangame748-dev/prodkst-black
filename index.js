@@ -1,656 +1,752 @@
-
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder } = require('discord.js');
 const express = require('express');
-const session = require('express-session');
-const passport = require('passport');
-const DiscordStrategy = require('passport-discord').Strategy;
+const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const axios = require('axios');
+const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
 
-// ============================================
-// 📊 نظام البيانات والإعدادات
-// ============================================
+// ==================== CONFIG ====================
+const PORT = process.env.PORT || 3000;
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || 'YOUR_CLIENT_ID';
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
+const REDIRECT_URI = process.env.REDIRECT_URI || `http://localhost:${PORT}/callback`;
+const RESULTS_FILE = path.join(__dirname, 'detected_usernames.json');
 
-// بنية البيانات الرئيسية
-let gameData = {
-    users: {}, // { userID: { points: 0, properties: [] } }
-    guilds: {}, // { guildID: { settings, roulette } }
-    activeGames: new Map() // { messageID: { players, winner, status } }
-};
+// ==================== STATE ====================
+let detectedUsernames = [];
+let isSearching = false;
+let currentSession = null;
+let userSessions = {};
 
-// الخصائص المتاحة في المتجر
-const PROPERTIES = {
-    'extra_life': {
-        name: '🛡️ روح إضافية',
-        description: 'حماية من الطرد مرة واحدة',
-        price: 70,
-        emoji: '🛡️'
-    },
-    'protection': {
-        name: '🔒 حماية من الطرد',
-        description: 'لا تُطرد في هذه الجولة',
-        price: 80,
-        emoji: '🔒'
-    },
-    'double_kick': {
-        name: '⚡ طرد مزدوج',
-        description: 'اطرد شخصين بدلاً من واحد',
-        price: 90,
-        emoji: '⚡'
-    }
-};
-
-// --- إعداد بوت ديسكورد ---
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.DirectMessages
-    ],
-    partials: [Partials.Channel, Partials.Message]
-});
-
-client.on('ready', (c) => {
-    console.log(`✅ Logged in as ${c.user.tag}!`);
-    client.user.setActivity('X-Gamer Roulette 🎰', { type: 'PLAYING' });
-});
-
-// ============================================
-// 🎮 محرك اللعبة داخل ديسكورد
-// ============================================
-
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
-
-    const userId = interaction.user.id;
-    const guildId = interaction.guildId;
-
-    // تهيئة بيانات المستخدم
-    if (!gameData.users[userId]) {
-        gameData.users[userId] = { points: 0, properties: [] };
-    }
-
-    // --- زر الدخول للعبة (Join) ---
-    if (interaction.customId === 'btn_join') {
-        const embed = interaction.message.embeds[0];
-        const description = embed.description || '';
-
-        if (description.includes(userId)) {
-            return interaction.reply({ content: '❌ أنت بالفعل في اللعبة!', ephemeral: true });
-        }
-
-        const newDescription = description + `\n✅ <@${userId}>`;
-        const updatedEmbed = EmbedBuilder.from(embed).setDescription(newDescription);
-
-        await interaction.message.edit({ embeds: [updatedEmbed] });
-        await interaction.reply({ content: '✅ تم إضافتك للعبة!', ephemeral: true });
-    }
-
-    // --- زر الخروج من العبة (Leave) ---
-    if (interaction.customId === 'btn_leave') {
-        const embed = interaction.message.embeds[0];
-        let description = embed.description || '';
-
-        if (!description.includes(userId)) {
-            return interaction.reply({ content: '❌ أنت لست في اللعبة!', ephemeral: true });
-        }
-
-        description = description.replace(`\n✅ <@${userId}>`, '').replace(`✅ <@${userId}>`, '');
-        const updatedEmbed = EmbedBuilder.from(embed).setDescription(description);
-
-        await interaction.message.edit({ embeds: [updatedEmbed] });
-        await interaction.reply({ content: '❌ تم إزالتك من اللعبة!', ephemeral: true });
-    }
-
-    // --- زر المتجر (Store) ---
-    if (interaction.customId === 'btn_store') {
-        const userPoints = gameData.users[userId]?.points || 0;
-        const userProperties = gameData.users[userId]?.properties || [];
-
-        let storeEmbed = new EmbedBuilder()
-            .setTitle('🛍️ متجر الخصائص')
-            .setColor('#FFD700')
-            .setDescription(`💰 **نقاطك الحالية:** ${userPoints}\n\n**الخصائص المتاحة:**`);
-
-        Object.entries(PROPERTIES).forEach(([key, prop]) => {
-            const owned = userProperties.includes(key) ? '✅' : '❌';
-            storeEmbed.addFields({
-                name: `${prop.emoji} ${prop.name}`,
-                value: `${prop.description}\n💵 السعر: ${prop.price} نقطة ${owned}`,
-                inline: false
-            });
-        });
-
-        const storeRow = new ActionRowBuilder()
-            .addComponents(
-                new StringSelectMenuBuilder()
-                    .setCustomId('store_select')
-                    .setPlaceholder('اختر خاصية لشرائها')
-                    .addOptions(
-                        Object.entries(PROPERTIES).map(([key, prop]) => ({
-                            label: prop.name,
-                            value: key,
-                            emoji: prop.emoji
-                        }))
-                    )
-            );
-
-        await interaction.reply({ embeds: [storeEmbed], components: [storeRow], ephemeral: true });
-    }
-
-    // --- قائمة المتجر (Store Select Menu) ---
-    if (interaction.customId === 'store_select') {
-        const propertyKey = interaction.values[0];
-        const property = PROPERTIES[propertyKey];
-        const userPoints = gameData.users[userId]?.points || 0;
-
-        if (userPoints < property.price) {
-            const needed = property.price - userPoints;
-            return interaction.reply({
-                content: `❌ ليس لديك نقاط كافية!\n💰 تحتاج ${needed} نقطة إضافية (لديك ${userPoints} من ${property.price})`,
-                ephemeral: true
-            });
-        }
-
-        gameData.users[userId].points -= property.price;
-        if (!gameData.users[userId].properties.includes(propertyKey)) {
-            gameData.users[userId].properties.push(propertyKey);
-        }
-
-        await interaction.reply({
-            content: `✅ تم شراء ${property.emoji} ${property.name} بنجاح!\n💰 نقاطك المتبقية: ${gameData.users[userId].points}`,
-            ephemeral: true
-        });
-    }
-
-    // --- زر بدء اللعبة (Start Game) ---
-    if (interaction.customId === 'btn_start_game') {
-        const embed = interaction.message.embeds[0];
-        const description = embed.description || '';
-
-        // استخراج اللاعبين من الوصف
-        const playerMatches = description.match(/<@(\d+)>/g) || [];
-        if (playerMatches.length < 2) {
-            return interaction.reply({ content: '❌ يجب أن يكون هناك لاعبين على الأقل!', ephemeral: true });
-        }
-
-        const players = playerMatches.map(m => m.match(/\d+/)[0]);
-        const winner = players[Math.floor(Math.random() * players.length)];
-
-        // حفظ اللعبة
-        gameData.activeGames.set(interaction.message.id, {
-            players,
-            winner,
-            kicked: [],
-            status: 'running'
-        });
-
-        // إنشء Embed النتيجة
-        const resultEmbed = new EmbedBuilder()
-            .setTitle('🎰 نتيجة الروليت!')
-            .setColor('#00FF00')
-            .setDescription(`🏆 **الفائز:** <@${winner}>\n\n**اللاعبون:**\n${players.map(p => `• <@${p}>`).join('\n')}`)
-            .setTimestamp();
-
-        // إضافة النقاط للفائز
-        gameData.users[winner].points += 15;
-
-        // إنشاء أزرار الطرد
-        const kickRow = new ActionRowBuilder();
-        players.forEach(player => {
-            if (player !== winner) {
-                kickRow.addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`btn_kick_${player}`)
-                        .setLabel(`اطرد ${player.substring(0, 4)}...`)
-                        .setStyle(ButtonStyle.Danger)
-                );
-            }
-        });
-
-        await interaction.message.edit({ embeds: [resultEmbed], components: [kickRow] });
-        await interaction.reply({ content: '✅ بدأت اللعبة!', ephemeral: true });
-    }
-
-    // --- أزرار الطرد ---
-    if (interaction.customId.startsWith('btn_kick_')) {
-        const kickedUserId = interaction.customId.replace('btn_kick_', '');
-        const game = gameData.activeGames.get(interaction.message.id);
-
-        if (!game) {
-            return interaction.reply({ content: '❌ اللعبة انتهت!', ephemeral: true });
-        }
-
-        // التحقق من الحماية
-        if (gameData.users[kickedUserId]?.properties.includes('protection')) {
-            gameData.users[kickedUserId].properties = gameData.users[kickedUserId].properties.filter(p => p !== 'protection');
-            return interaction.reply({ content: `🛡️ <@${kickedUserId}> محمي من الطرد!`, ephemeral: true });
-        }
-
-        // الطرد المزدوج
-        let kickCount = 1;
-        if (gameData.users[interaction.user.id]?.properties.includes('double_kick')) {
-            kickCount = 2;
-            gameData.users[interaction.user.id].properties = gameData.users[interaction.user.id].properties.filter(p => p !== 'double_kick');
-        }
-
-        // إضافة النقاط للاعب الذي طرد
-        gameData.users[interaction.user.id].points += 7 * kickCount;
-        game.kicked.push(kickedUserId);
-
-        await interaction.reply({
-            content: `⚡ تم طرد <@${kickedUserId}>! حصلت على ${7 * kickCount} نقطة!`,
-            ephemeral: true
-        });
-    }
-});
-
-// ============================================
-// 💬 أوامر الدردشة
-// ============================================
-
-client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.guild) return;
-
-    const guildId = message.guildId;
-    const userId = message.author.id;
-
-    // تهيئة بيانات السيرفر
-    if (!gameData.guilds[guildId]) {
-        gameData.guilds[guildId] = {
-            settings: {
-                color: '#ff0000',
-                maxPlayers: 10,
-                command: '!roulette',
-                allowedRole: '',
-                targetChannel: ''
-            },
-            roulette: {}
-        };
-    }
-
-    const guildSettings = gameData.guilds[guildId].settings;
-    const commandPrefix = guildSettings.command || '!roulette';
-
-    // --- أمر بدء اللعبة ---
-    if (message.content.trim() === commandPrefix) {
-        // التحقق من الصلاحيات
-        if (guildSettings.allowedRole && !message.member.roles.cache.has(guildSettings.allowedRole)) {
-            return message.reply('❌ ليس لديك صلاحية لتشغيل هذا الأمر!');
-        }
-
-        if (guildSettings.targetChannel && message.channel.id !== guildSettings.targetChannel) {
-            return message.reply(`❌ هذا الأمر يعمل فقط في <#${guildSettings.targetChannel}>`);
-        }
-
-        // إنشاء Embed اللعبة
-        const gameEmbed = new EmbedBuilder()
-            .setTitle('🎰 X-Gamer Roulette')
-            .setDescription('✅ اضغط على الأزرار للدخول أو الخروج من اللعبة')
-            .setColor(guildSettings.color)
-            .addFields(
-                { name: '👥 اللاعبون:', value: 'لم يدخل أحد بعد', inline: false },
-                { name: '💰 الجائزة:', value: '15 نقطة للفائز + 7 نقاط لكل طرد', inline: false }
-            )
-            .setTimestamp();
-
-        // إنشاء الأزرار
-        const gameRow = new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId('btn_join')
-                    .setLabel('دخول 🟢')
-                    .setStyle(ButtonStyle.Success),
-                new ButtonBuilder()
-                    .setCustomId('btn_leave')
-                    .setLabel('خروج 🔴')
-                    .setStyle(ButtonStyle.Danger),
-                new ButtonBuilder()
-                    .setCustomId('btn_store')
-                    .setLabel('متجر 🛍️')
-                    .setStyle(ButtonStyle.Primary),
-                new ButtonBuilder()
-                    .setCustomId('btn_start_game')
-                    .setLabel('بدء اللعبة ▶️')
-                    .setStyle(ButtonStyle.Secondary)
-            );
-
-        await message.channel.send({ embeds: [gameEmbed], components: [gameRow] });
-    }
-
-    // --- أمر عرض النقاط ---
-    if (message.content.trim() === '!points' || message.content.trim() === '!نقاطي') {
-        const userPoints = gameData.users[userId]?.points || 0;
-        const userProperties = gameData.users[userId]?.properties || [];
-
-        let pointsEmbed = new EmbedBuilder()
-            .setTitle('📊 إحصائياتك')
-            .setColor('#FFD700')
-            .setDescription(`💰 **نقاطك:** ${userPoints}\n\n**خصائصك:**`);
-
-        if (userProperties.length === 0) {
-            pointsEmbed.addFields({ name: 'لا توجد خصائص', value: 'اشتري خصائص من المتجر!' });
-        } else {
-            userProperties.forEach(prop => {
-                const property = PROPERTIES[prop];
-                if (property) {
-                    pointsEmbed.addFields({ name: property.emoji + ' ' + property.name, value: property.description });
-                }
-            });
-        }
-
-        await message.reply({ embeds: [pointsEmbed] });
-    }
-});
-
-// ============================================
-// 🌐 لوحة التحكم (Express)
-// ============================================
-
-const app = express();
-const port = process.env.PORT || 3000;
-const domain = process.env.DOMAIN || `http://localhost:${port}`;
-
-// Middleware
-app.use(session({
-    secret: process.env.SESSION_SECRET || 'x-gamer-secret-key',
-    resave: false,
-    saveUninitialized: false
-}));
-
-app.use(passport.initialize());
-app.use(passport.session());
-app.use(express.json());
-
-// Passport Configuration
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((obj, done) => done(null, obj));
-
-passport.use(new DiscordStrategy({
-    clientID: process.env.CLIENT_ID,
-    clientSecret: process.env.CLIENT_SECRET,
-    callbackURL: `${domain}/auth/discord/callback`,
-    scope: ['identify', 'guilds']
-}, (accessToken, refreshToken, profile, done) => {
-    process.nextTick(() => done(null, profile));
-}));
-
-// دالة مساعدة لرسم الصفحات
-function renderPage(title, content) {
-    return `
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${title} - X-GAMER</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-        <style>
-            body { background-color: #050505; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        </style>
-    </head>
-    <body>
-        ${content}
-    </body>
-    </html>`;
+// Load results from file
+if (fs.existsSync(RESULTS_FILE)) {
+  detectedUsernames = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8'));
 }
 
-// --- الصفحة الرئيسية ---
-app.get('/', (req, res) => {
-    if (req.isAuthenticated()) return res.redirect('/dashboard');
-    res.send(renderPage('Home', `
-        <div class="min-h-screen bg-gradient-to-b from-red-900 to-black flex items-center justify-center">
-            <div class="text-center">
-                <h1 class="text-7xl font-bold mb-6 text-red-500 animate-pulse">🎰 X-GAMER</h1>
-                <p class="text-2xl mb-10 text-gray-300">نظام الروليت الأكثر قوة واحترافية في ديسكورد</p>
-                <a href="/auth/discord" class="bg-red-600 hover:bg-red-700 text-white px-12 py-4 rounded-full font-bold text-xl transition-all transform hover:scale-110 inline-block">
-                    تسجيل الدخول عبر ديسكورد
-                </a>
-            </div>
-        </div>
-    `));
+// ==================== EXPRESS APP ====================
+const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
+// ==================== DISCORD OAUTH ====================
+app.get('/login', (req, res) => {
+  const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify%20guilds`;
+  res.redirect(authUrl);
 });
 
-app.get('/auth/discord', passport.authenticate('discord'));
-app.get('/auth/discord/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => res.redirect('/dashboard'));
-app.get('/logout', (req, res) => { req.logout(() => res.redirect('/')); });
+app.get('/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.redirect('/');
+  }
 
-// --- لوحة التحكم الرئيسية ---
-app.get('/dashboard', (req, res) => {
-    if (!req.isAuthenticated()) return res.redirect('/');
+  try {
+    const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', {
+      client_id: DISCORD_CLIENT_ID,
+      client_secret: DISCORD_CLIENT_SECRET,
+      code,
+      grant_type: 'authorization_code',
+      redirect_uri: REDIRECT_URI,
+    });
 
-    const userGuilds = req.user.guilds.filter(g => (g.permissions & 0x8) === 0x8);
+    const accessToken = tokenResponse.data.access_token;
+    const userResponse = await axios.get('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
 
-    let guildListHtml = userGuilds.map(g => `
-        <div class="guild-card bg-zinc-900 p-4 rounded-xl mb-4 flex items-center justify-between border-l-4 border-transparent hover:border-red-600 transition-all cursor-pointer" onclick="window.location='/dashboard/${g.id}'">
-            <div class="flex items-center">
-                <img src="${g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-12 h-12 rounded-full mr-4">
-                <span class="text-lg font-semibold">${g.name}</span>
-            </div>
-            <i class="fas fa-chevron-left text-gray-600"></i>
-        </div>
-    `).join('');
-
-    res.send(renderPage('Dashboard', `
-        <div class="flex h-screen overflow-hidden">
-            <div class="w-80 bg-black border-l border-zinc-800 p-6 overflow-y-auto">
-                <h2 class="text-2xl font-bold mb-8 text-red-600">X-GAMER</h2>
-                <div class="space-y-2">
-                    <p class="text-xs text-gray-500 uppercase tracking-widest mb-4">السيرفرات الخاصة بك</p>
-                    ${guildListHtml}
-                </div>
-            </div>
-            <div class="flex-1 bg-zinc-950 p-10 overflow-y-auto">
-                <div class="flex justify-between items-center mb-10">
-                    <h1 class="text-3xl font-bold">مرحباً بك، ${req.user.username}</h1>
-                    <a href="/logout" class="text-gray-400 hover:text-white">تسجيل الخروج</a>
-                </div>
-                <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800">
-                    <h3 class="text-xl font-bold mb-4">👋 أهلاً وسهلاً</h3>
-                    <p class="text-gray-400">اختر سيرفر من القائمة الجانبية لتخصيص إعدادات الروليت والمتجر.</p>
-                </div>
-            </div>
-        </div>
-    `));
-});
-
-// --- إعدادات السيرفر ---
-app.get('/dashboard/:guildID', async (req, res) => {
-    if (!req.isAuthenticated()) return res.redirect('/');
-
-    const guildID = req.params.guildID;
-    const guild = req.user.guilds.find(g => g.id === guildID);
-    if (!guild || (guild.permissions & 0x8) !== 0x8) return res.redirect('/dashboard');
-
-    const settings = gameData.guilds[guildID]?.settings || gameData.guilds[guildID]?.settings || {
-        color: '#ff0000',
-        maxPlayers: 10,
-        command: '!roulette',
-        allowedRole: '',
-        targetChannel: ''
+    const userId = userResponse.data.id;
+    const sessionId = `session_${userId}_${Date.now()}`;
+    userSessions[sessionId] = {
+      userId,
+      accessToken,
+      createdAt: Date.now(),
     };
 
-    res.send(renderPage('Server Settings', `
-        <div class="flex h-screen overflow-hidden">
-            <div class="w-80 bg-black border-l border-zinc-800 p-6 overflow-y-auto">
-                <h2 class="text-2xl font-bold mb-8 text-red-600 cursor-pointer" onclick="window.location='/dashboard'">X-GAMER</h2>
-                <div class="space-y-2">
-                    <p class="text-xs text-gray-500 uppercase tracking-widest mb-4">السيرفرات الخاصة بك</p>
-                    ${req.user.guilds.filter(g => (g.permissions & 0x8) === 0x8).map(g => `
-                        <div class="guild-card bg-zinc-900 p-4 rounded-xl mb-4 flex items-center justify-between border-l-4 ${g.id === guildID ? 'border-red-600 bg-zinc-800' : 'border-transparent'} hover:border-red-600 transition-all cursor-pointer" onclick="window.location='/dashboard/${g.id}'">
-                            <div class="flex items-center">
-                                <img src="${g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-10 h-10 rounded-full mr-3">
-                                <span class="text-sm font-semibold truncate w-32">${g.name}</span>
-                            </div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
-            <div class="flex-1 bg-zinc-950 p-10 overflow-y-auto">
-                <div class="flex items-center mb-10">
-                    <img src="${guild.icon ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png` : 'https://cdn.discordapp.com/embed/avatars/0.png'}" class="w-16 h-16 rounded-full mr-6 border-2 border-red-600">
-                    <div>
-                        <h1 class="text-3xl font-bold">${guild.name}</h1>
-                        <p class="text-gray-400">تخصيص إعدادات الروليت</p>
-                    </div>
-                </div>
-
-                <div class="max-w-4xl space-y-8">
-                    <!-- الألوان والمظهر -->
-                    <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
-                        <h3 class="text-xl font-bold mb-6 text-red-500">🎨 الألوان والمظهر</h3>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">لون اللعبة الأساسي</label>
-                                <input type="color" id="gameColor" value="${settings.color}" class="w-full h-12 bg-zinc-800 border-none rounded-lg cursor-pointer">
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- إعدادات اللعبة -->
-                    <div class="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
-                        <h3 class="text-xl font-bold mb-6 text-red-500">⚙️ إعدادات اللعبة</h3>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">أمر بدء اللعبة</label>
-                                <input type="text" id="command" value="${settings.command}" placeholder="مثال: !roulette" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
-                            </div>
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">عدد اللاعبين الأقصى</label>
-                                <input type="number" id="maxPlayers" value="${settings.maxPlayers}" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
-                            </div>
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">روم اللعبة</label>
-                                <select id="targetChannel" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
-                                    <option value="">اختر روم (اختياري)</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">رتبة التحكم</label>
-                                <select id="allowedRole" class="w-full bg-zinc-800 border border-zinc-700 p-3 rounded-lg focus:outline-none focus:border-red-600 transition-all">
-                                    <option value="">اختر رتبة (اختياري)</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <button onclick="saveSettings('${guildID}')" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-4 rounded-xl transition-all transform hover:scale-[1.02] shadow-lg shadow-red-900/20">
-                        💾 حفظ الإعدادات
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            // تحميل القنوات والرتب
-            async function loadChannelsAndRoles() {
-                try {
-                    const response = await fetch('/api/guild/${guildID}/info');
-                    const data = await response.json();
-
-                    const channelSelect = document.getElementById('targetChannel');
-                    const roleSelect = document.getElementById('allowedRole');
-
-                    data.channels.forEach(channel => {
-                        const option = document.createElement('option');
-                        option.value = channel.id;
-                        option.textContent = '#' + channel.name;
-                        if (channel.id === '${settings.targetChannel}') option.selected = true;
-                        channelSelect.appendChild(option);
-                    });
-
-                    data.roles.forEach(role => {
-                        const option = document.createElement('option');
-                        option.value = role.id;
-                        option.textContent = '@' + role.name;
-                        if (role.id === '${settings.allowedRole}') option.selected = true;
-                        roleSelect.appendChild(option);
-                    });
-                } catch (error) {
-                    console.error('خطأ في تحميل البيانات:', error);
-                }
-            }
-
-            async function saveSettings(guildID) {
-                const data = {
-                    color: document.getElementById('gameColor').value,
-                    maxPlayers: parseInt(document.getElementById('maxPlayers').value),
-                    command: document.getElementById('command').value || '!roulette',
-                    targetChannel: document.getElementById('targetChannel').value,
-                    allowedRole: document.getElementById('allowedRole').value
-                };
-
-                try {
-                    const res = await fetch('/api/settings/' + guildID, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(data)
-                    });
-
-                    if (res.ok) {
-                        alert('✅ تم الحفظ بنجاح!');
-                    } else {
-                        alert('❌ حدث خطأ أثناء الحفظ.');
-                    }
-                } catch (error) {
-                    alert('❌ خطأ في الاتصال: ' + error.message);
-                }
-            }
-
-            loadChannelsAndRoles();
-        </script>
-    `));
+    res.redirect(`/?session=${sessionId}`);
+  } catch (error) {
+    console.error('OAuth error:', error);
+    res.redirect('/');
+  }
 });
 
-// --- API لحفظ الإعدادات ---
-app.post('/api/settings/:guildID', (req, res) => {
-    if (!req.isAuthenticated()) return res.status(401).send('Unauthorized');
+// ==================== API ENDPOINTS ====================
+app.post('/api/start-search', (req, res) => {
+  const { botToken, serverId, channelId, sessionId } = req.body;
 
-    const guildID = req.params.guildID;
-    if (!gameData.guilds[guildID]) {
-        gameData.guilds[guildID] = { settings: {}, roulette: {} };
+  if (!botToken || !serverId || !channelId) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  isSearching = true;
+  currentSession = { botToken, serverId, channelId, sessionId };
+  detectedUsernames = [];
+  saveResults();
+
+  startUsernameSearch(botToken, serverId, channelId);
+
+  res.json({ success: true, message: 'Search started' });
+});
+
+app.post('/api/stop-search', (req, res) => {
+  const { sessionId } = req.body;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  isSearching = false;
+  res.json({ success: true, message: 'Search stopped' });
+});
+
+app.get('/api/results', (req, res) => {
+  const { sessionId } = req.query;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const stats = {
+    total: detectedUsernames.length,
+    threeChar: detectedUsernames.filter(u => u.length === 3).length,
+    twoChar: detectedUsernames.filter(u => u.length === 2).length,
+    oneChar: detectedUsernames.filter(u => u.length === 1).length,
+  };
+
+  res.json({
+    stats,
+    usernames: detectedUsernames.map((u, i) => ({
+      id: i,
+      username: u,
+      length: u.length,
+      detectedAt: new Date().toISOString(),
+    })),
+  });
+});
+
+app.post('/api/clear-results', (req, res) => {
+  const { sessionId } = req.body;
+
+  if (!userSessions[sessionId]) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  detectedUsernames = [];
+  saveResults();
+  res.json({ success: true, message: 'Results cleared' });
+});
+
+// ==================== DISCORD BOT ====================
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
+  ],
+});
+
+client.on('ready', () => {
+  console.log(`✅ Bot logged in as ${client.user.tag}`);
+});
+
+client.on('error', error => {
+  console.error('Discord bot error:', error);
+});
+
+// ==================== USERNAME SEARCH ENGINE ====================
+async function startUsernameSearch(botToken, serverId, channelId) {
+  try {
+    const client = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+    });
+
+    await client.login(botToken);
+
+    client.on('ready', async () => {
+      try {
+        const guild = await client.guilds.fetch(serverId);
+        const channel = await guild.channels.fetch(channelId);
+
+        if (!channel || channel.type !== ChannelType.GuildText) {
+          console.error('Invalid channel');
+          client.destroy();
+          return;
+        }
+
+        // Simulate username search (3-char and 2-char usernames)
+        const searchResults = generateThreeCharUsernames(100);
+
+        for (const username of searchResults) {
+          if (!isSearching) break;
+
+          detectedUsernames.push(username);
+          saveResults();
+
+          // Send to Discord channel
+          try {
+            await channel.send(`✅ **Found:** \`${username}\``);
+          } catch (err) {
+            console.error('Failed to send message:', err);
+          }
+
+          // Small delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        isSearching = false;
+        await channel.send('🏁 **Search completed!**');
+        client.destroy();
+      } catch (error) {
+        console.error('Search error:', error);
+        client.destroy();
+      }
+    });
+  } catch (error) {
+    console.error('Bot login error:', error);
+  }
+}
+
+function generateThreeCharUsernames(count) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const usernames = [];
+
+  // Generate 3-char usernames
+  for (let i = 0; i < count * 0.6; i++) {
+    let username = '';
+    for (let j = 0; j < 3; j++) {
+      username += chars[Math.floor(Math.random() * chars.length)];
+    }
+    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
+      usernames.push(username);
+    }
+  }
+
+  // Generate 2-char usernames
+  for (let i = 0; i < count * 0.3; i++) {
+    let username = '';
+    for (let j = 0; j < 2; j++) {
+      username += chars[Math.floor(Math.random() * chars.length)];
+    }
+    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
+      usernames.push(username);
+    }
+  }
+
+  // Generate 1-char usernames
+  for (let i = 0; i < count * 0.1; i++) {
+    const username = chars[Math.floor(Math.random() * chars.length)];
+    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
+      usernames.push(username);
+    }
+  }
+
+  return usernames.slice(0, count);
+}
+
+function saveResults() {
+  fs.writeFileSync(RESULTS_FILE, JSON.stringify(detectedUsernames, null, 2));
+}
+
+// ==================== STATIC HTML ====================
+app.get('/', (req, res) => {
+  const sessionId = req.query.session || '';
+  const isAuthenticated = !!userSessions[sessionId];
+
+  const html = `
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DISCORD USERNAME HUNTER</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
     }
 
-    gameData.guilds[guildID].settings = {
-        color: req.body.color || '#ff0000',
-        maxPlayers: req.body.maxPlayers || 10,
-        command: req.body.command || '!roulette',
-        targetChannel: req.body.targetChannel || '',
-        allowedRole: req.body.allowedRole || ''
-    };
+    body {
+      font-family: 'Space Mono', 'Courier New', monospace;
+      background-color: #000000;
+      color: #ffffff;
+      line-height: 1.6;
+      letter-spacing: 2px;
+    }
 
-    res.sendStatus(200);
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+
+    /* HEADER */
+    header {
+      margin-bottom: 40px;
+    }
+
+    h1 {
+      font-size: 48px;
+      font-weight: 900;
+      letter-spacing: 4px;
+      margin-bottom: 20px;
+      text-transform: uppercase;
+    }
+
+    .red-line {
+      height: 4px;
+      background-color: #ff0000;
+      width: 100%;
+      margin: 20px 0;
+    }
+
+    .welcome-text {
+      font-size: 14px;
+      letter-spacing: 1px;
+      margin-bottom: 20px;
+    }
+
+    /* AUTH */
+    .auth-section {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 40px;
+      align-items: center;
+    }
+
+    .auth-button {
+      background-color: #ff0000;
+      color: #000000;
+      border: 2px solid #ffffff;
+      padding: 12px 30px;
+      font-size: 14px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all 0.2s;
+    }
+
+    .auth-button:hover {
+      background-color: #ffffff;
+      color: #000000;
+    }
+
+    .auth-button:active {
+      transform: scale(0.98);
+    }
+
+    .session-info {
+      font-size: 12px;
+      color: #888888;
+    }
+
+    /* CONFIGURATION SECTION */
+    .section {
+      margin-bottom: 40px;
+    }
+
+    .section-title {
+      font-size: 24px;
+      font-weight: 900;
+      letter-spacing: 3px;
+      margin-bottom: 20px;
+      text-transform: uppercase;
+      border-bottom: 2px solid #ffffff;
+      padding-bottom: 10px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      padding: 12px;
+      background-color: #1a1a1a;
+      border: 2px solid #ffffff;
+      color: #ffffff;
+      font-family: 'Space Mono', monospace;
+      font-size: 14px;
+      letter-spacing: 1px;
+    }
+
+    input[type="text"]:focus,
+    input[type="password"]:focus {
+      outline: none;
+      background-color: #2a2a2a;
+      border-color: #ff0000;
+    }
+
+    /* BUTTONS */
+    .button-group {
+      display: flex;
+      gap: 15px;
+      margin-top: 20px;
+    }
+
+    button {
+      flex: 1;
+      padding: 15px;
+      background-color: #ff0000;
+      color: #000000;
+      border: 2px solid #ffffff;
+      font-family: 'Space Mono', monospace;
+      font-size: 12px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all 0.2s;
+    }
+
+    button:hover {
+      background-color: #ffffff;
+      color: #000000;
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    button.stop {
+      background-color: #333333;
+      color: #ff0000;
+    }
+
+    button.stop:hover {
+      background-color: #ff0000;
+      color: #ffffff;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* STATISTICS */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 20px;
+      margin-bottom: 40px;
+    }
+
+    .stat-box {
+      border: 2px solid #ffffff;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .stat-number {
+      font-size: 48px;
+      font-weight: 900;
+      color: #ff0000;
+      margin-bottom: 10px;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    /* RESULTS TABLE */
+    .results-section {
+      margin-top: 40px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 2px solid #ffffff;
+    }
+
+    thead {
+      background-color: #1a1a1a;
+      border-bottom: 2px solid #ff0000;
+    }
+
+    th {
+      padding: 15px;
+      text-align: right;
+      font-size: 12px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    td {
+      padding: 12px 15px;
+      border-bottom: 1px solid #333333;
+      font-size: 13px;
+    }
+
+    tr:hover {
+      background-color: #1a1a1a;
+    }
+
+    .username-cell {
+      font-family: 'Courier New', monospace;
+      color: #ff0000;
+      font-weight: bold;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 20px;
+      color: #888888;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid #ff0000;
+      border-top: 2px solid transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .error {
+      background-color: #ff0000;
+      color: #000000;
+      padding: 15px;
+      margin-bottom: 20px;
+      border: 2px solid #ffffff;
+      font-weight: bold;
+    }
+
+    .success {
+      background-color: #00ff00;
+      color: #000000;
+      padding: 15px;
+      margin-bottom: 20px;
+      border: 2px solid #ffffff;
+      font-weight: bold;
+    }
+
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>DISCORD USERNAME HUNTER</h1>
+      <div class="red-line"></div>
+      <div class="welcome-text">
+        ${isAuthenticated ? '✅ مرحباً - لوحة التحكم' : '⚠️ يرجى تسجيل الدخول عبر ديسكورد'}
+      </div>
+    </header>
+
+    ${!isAuthenticated ? `
+      <div class="auth-section">
+        <a href="/login" style="text-decoration: none;">
+          <button class="auth-button">تسجيل الدخول عبر ديسكورد</button>
+        </a>
+      </div>
+    ` : `
+      <div class="session-info">
+        Session ID: <code>${sessionId.substring(0, 20)}...</code>
+      </div>
+
+      <div id="message"></div>
+
+      <div class="section">
+        <div class="section-title">CONFIGURATION</div>
+        
+        <div class="form-group">
+          <label>BOT TOKEN</label>
+          <input type="password" id="botToken" placeholder="أدخل توكن البوت">
+        </div>
+
+        <div class="form-group">
+          <label>SERVER ID</label>
+          <input type="text" id="serverId" placeholder="معرف السيرفر">
+        </div>
+
+        <div class="form-group">
+          <label>CHANNEL ID</label>
+          <input type="text" id="channelId" placeholder="معرف الروم">
+        </div>
+
+        <div class="button-group">
+          <button id="startBtn" onclick="startSearch()">▶ START SEARCH</button>
+          <button id="stopBtn" class="stop" onclick="stopSearch()" disabled>⏹ STOP SEARCH</button>
+          <button onclick="clearResults()">🗑 CLEAR RESULTS</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">STATISTICS</div>
+        <div class="stats-grid">
+          <div class="stat-box">
+            <div class="stat-number" id="totalStat">0</div>
+            <div class="stat-label">TOTAL FOUND</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-number" id="threeCharStat">0</div>
+            <div class="stat-label">3-CHARACTER</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-number" id="twoCharStat">0</div>
+            <div class="stat-label">2-CHARACTER</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-number" id="oneCharStat">0</div>
+            <div class="stat-label">1-CHARACTER</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="results-section">
+        <div class="section-title">DETECTED USERNAMES</div>
+        <div id="resultsContainer">
+          <div class="loading">جاري تحميل النتائج...</div>
+        </div>
+      </div>
+    `}
+  </div>
+
+  <script>
+    const sessionId = new URLSearchParams(window.location.search).get('session');
+
+    async function startSearch() {
+      const botToken = document.getElementById('botToken').value;
+      const serverId = document.getElementById('serverId').value;
+      const channelId = document.getElementById('channelId').value;
+
+      if (!botToken || !serverId || !channelId) {
+        showMessage('الرجاء ملء جميع الحقول', 'error');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/start-search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ botToken, serverId, channelId, sessionId }),
+        });
+
+        if (response.ok) {
+          showMessage('✅ تم بدء البحث', 'success');
+          document.getElementById('startBtn').disabled = true;
+          document.getElementById('stopBtn').disabled = false;
+          loadResults();
+          setInterval(loadResults, 2000);
+        } else {
+          showMessage('❌ خطأ في بدء البحث', 'error');
+        }
+      } catch (error) {
+        showMessage('❌ خطأ: ' + error.message, 'error');
+      }
+    }
+
+    async function stopSearch() {
+      try {
+        const response = await fetch('/api/stop-search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId }),
+        });
+
+        if (response.ok) {
+          showMessage('✅ تم إيقاف البحث', 'success');
+          document.getElementById('startBtn').disabled = false;
+          document.getElementById('stopBtn').disabled = true;
+        }
+      } catch (error) {
+        showMessage('❌ خطأ: ' + error.message, 'error');
+      }
+    }
+
+    async function clearResults() {
+      try {
+        const response = await fetch('/api/clear-results', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId }),
+        });
+
+        if (response.ok) {
+          showMessage('✅ تم مسح النتائج', 'success');
+          loadResults();
+        }
+      } catch (error) {
+        showMessage('❌ خطأ: ' + error.message, 'error');
+      }
+    }
+
+    async function loadResults() {
+      try {
+        const response = await fetch(\`/api/results?sessionId=\${sessionId}\`);
+        const data = await response.json();
+
+        document.getElementById('totalStat').textContent = data.stats.total;
+        document.getElementById('threeCharStat').textContent = data.stats.threeChar;
+        document.getElementById('twoCharStat').textContent = data.stats.twoChar;
+        document.getElementById('oneCharStat').textContent = data.stats.oneChar;
+
+        let html = '<table><thead><tr><th>USERNAME</th><th>LENGTH</th><th>DETECTED AT</th></tr></thead><tbody>';
+        
+        if (data.usernames.length === 0) {
+          html += '<tr><td colspan="3" style="text-align: center; color: #888;">لا توجد نتائج</td></tr>';
+        } else {
+          data.usernames.forEach(u => {
+            html += \`<tr><td class="username-cell">\${u.username}</td><td>\${u.length}</td><td>\${new Date(u.detectedAt).toLocaleString('ar-SA')}</td></tr>\`;
+          });
+        }
+        
+        html += '</tbody></table>';
+        document.getElementById('resultsContainer').innerHTML = html;
+      } catch (error) {
+        console.error('Error loading results:', error);
+      }
+    }
+
+    function showMessage(text, type) {
+      const msgDiv = document.getElementById('message');
+      msgDiv.innerHTML = \`<div class="\${type}">\${text}</div>\`;
+      setTimeout(() => { msgDiv.innerHTML = ''; }, 5000);
+    }
+
+    // Load results on page load
+    if (sessionId) {
+      loadResults();
+      setInterval(loadResults, 3000);
+    }
+  </script>
+</body>
+</html>
+  `;
+
+  res.send(html);
 });
 
-// --- API لجلب معلومات السيرفر ---
-app.get('/api/guild/:guildID/info', (req, res) => {
-    if (!req.isAuthenticated()) return res.status(401).send('Unauthorized');
-
-    const guildID = req.params.guildID;
-    const guild = client.guilds.cache.get(guildID);
-
-    if (!guild) return res.status(404).send('Guild not found');
-
-    const channels = guild.channels.cache
-        .filter(ch => ch.isTextBased())
-        .map(ch => ({ id: ch.id, name: ch.name }));
-
-    const roles = guild.roles.cache
-        .filter(role => !role.managed && role.id !== guildID)
-        .map(role => ({ id: role.id, name: role.name }));
-
-    res.json({ channels, roles });
+// ==================== START SERVER ====================
+app.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║   DISCORD USERNAME HUNTER - RUNNING    ║
+║   http://localhost:${PORT}                 ║
+╚════════════════════════════════════════╝
+  `);
 });
-
-// ============================================
-// 🚀 بدء التطبيق
-// ============================================
-
-app.listen(port, () => {
-    console.log(`🌐 Server running on ${domain}`);
-});
-
-client.login(process.env.TOKEN);
