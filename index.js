@@ -48,28 +48,23 @@ client.on('ready', () => {
 
 async function checkThreeCharUsers() {
     if (!config.targetGuildId || !config.targetChannelId) return;
-
     const guild = client.guilds.cache.get(config.targetGuildId);
     if (!guild) return;
-
     const channel = guild.channels.cache.get(config.targetChannelId);
     if (!channel || !channel.isTextBased()) return;
 
     try {
         const members = await guild.members.fetch();
         const threeCharUsers = members.filter(m => m.user.username.length <= 3 && !m.user.bot);
-        
         if (threeCharUsers.size > 0) {
             const embed = new EmbedBuilder()
                 .setTitle('🎯 تم العثور على يوزرات مميزة!')
                 .setColor('#0099ff')
                 .setTimestamp();
-
-            let description = 'إليك قائمة باليوزرات الثلاثية أو شبه الثلاثية في هذا السيرفر:\n\n';
+            let description = 'إليك قائمة باليوزرات الثلاثية أو شبه الثلاثية:\n\n';
             threeCharUsers.forEach(member => {
                 description += `• **${member.user.username}** (ID: ${member.user.id})\n`;
             });
-            
             embed.setDescription(description);
             await channel.send({ embeds: [embed] });
         }
@@ -80,17 +75,8 @@ async function checkThreeCharUsers() {
 
 setInterval(checkThreeCharUsers, 30 * 60 * 1000);
 
-client.on('messageCreate', async (message) => {
-    if (message.content === '!check' && config.adminIds.includes(message.author.id)) {
-        await checkThreeCharUsers();
-        message.reply('✅ تم فحص اليوزرات وإرسال النتائج للروم المحدد.');
-    }
-});
-
 if (config.botToken) {
-    client.login(config.botToken).catch(err => console.error("Bot login failed. Check your token."));
-} else {
-    console.log("Waiting for Bot Token to be configured...");
+    client.login(config.botToken).catch(err => console.error("Bot login failed."));
 }
 
 // --- Dashboard Logic (Express) ---
@@ -104,85 +90,95 @@ app.use(session({
     saveUninitialized: false
 }));
 
-// Passport Setup - Wrapped in a function to handle missing credentials
-function setupPassport() {
-    if (!config.clientId || !config.clientSecret || !config.callbackURL) {
-        console.log("OAuth2 credentials missing. Dashboard login will be disabled until configured.");
-        return;
-    }
-    
+// Register Strategy (even with dummy if missing to avoid "Unknown strategy" error)
+function registerStrategy() {
     passport.use(new DiscordStrategy({
-        clientID: config.clientId,
-        clientSecret: config.clientSecret,
-        callbackURL: config.callbackURL,
+        clientID: config.clientId || '123',
+        clientSecret: config.clientSecret || '123',
+        callbackURL: config.callbackURL || 'http://localhost:3000/callback',
         scope: ['identify', 'guilds']
     }, (accessToken, refreshToken, profile, done) => {
         process.nextTick(() => done(null, profile));
     }));
-
-    passport.serializeUser((user, done) => done(null, user));
-    passport.deserializeUser((obj, done) => done(null, obj));
 }
 
-setupPassport();
+registerStrategy();
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
-function checkAuth(req, res, next) {
-    if (req.isAuthenticated()) {
-        if (config.adminIds.length === 0 || config.adminIds.includes(req.user.id)) {
-            return next();
-        }
-        return res.send('Access Denied: You are not an authorized admin.');
-    }
-    res.redirect('/login');
-}
-
 // Routes
 app.get('/', (req, res) => {
-    res.render('index', { user: req.user, configMissing: !config.clientId });
+    const isConfigured = config.clientId && config.clientSecret && config.callbackURL;
+    res.render('index', { user: req.user, isConfigured });
 });
 
 app.get('/login', (req, res, next) => {
-    if (!config.clientId) return res.send("Config missing. Please set CLIENT_ID in environment or config.json");
+    if (!config.clientId || !config.clientSecret) {
+        return res.send("<h1>خطأ في الإعدادات</h1><p>يرجى ضبط Client ID و Client Secret أولاً في صفحة الإعدادات.</p><a href='/'>العودة للرئيسية</a>");
+    }
     passport.authenticate('discord')(req, res, next);
 });
 
-app.get('/callback', passport.authenticate('discord', {
-    failureRedirect: '/'
-}), (req, res) => res.redirect('/dashboard'));
-
-app.get('/dashboard', checkAuth, (req, res) => {
-    const guilds = client.isReady() ? client.guilds.cache.map(g => ({ id: g.id, name: g.name })) : [];
-    res.render('dashboard', { 
-        user: req.user, 
-        config, 
-        guilds,
-        botUser: client.user
-    });
+app.get('/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => {
+    res.redirect('/dashboard');
 });
 
-app.post('/update-config', checkAuth, (req, res) => {
+app.get('/dashboard', (req, res) => {
+    if (!req.isAuthenticated()) return res.redirect('/login');
+    
+    // Authorization check
+    if (config.adminIds.length > 0 && !config.adminIds.includes(req.user.id)) {
+        return res.status(403).send("<h1>غير مسموح لك بالدخول</h1><p>ID الخاص بك غير موجود في قائمة الأدمن.</p>");
+    }
+
+    const guilds = client.isReady() ? client.guilds.cache.map(g => ({ id: g.id, name: g.name })) : [];
+    res.render('dashboard', { user: req.user, config, guilds, botUser: client.user });
+});
+
+// Initial Setup Route (No Auth needed if not configured)
+app.post('/setup', (req, res) => {
+    // Only allow setup if not fully configured OR if user is already admin
+    const isConfigured = config.clientId && config.clientSecret;
+    if (isConfigured && (!req.isAuthenticated() || !config.adminIds.includes(req.user.id))) {
+        return res.status(403).send("Setup locked.");
+    }
+
+    config.botToken = req.body.botToken || config.botToken;
+    config.clientId = req.body.clientId || config.clientId;
+    config.clientSecret = req.body.clientSecret || config.clientSecret;
+    config.callbackURL = req.body.callbackURL || config.callbackURL;
+    if (req.body.adminIds) {
+        config.adminIds = req.body.adminIds.split(',').map(id => id.trim()).filter(id => id);
+    }
+
+    saveConfig();
+    registerStrategy(); // Re-register with new values
+    
+    if (config.botToken && !client.isReady()) {
+        client.login(config.botToken).catch(console.error);
+    }
+
+    res.redirect(isConfigured ? '/dashboard' : '/');
+});
+
+app.post('/update-config', (req, res) => {
+    if (!req.isAuthenticated() || !config.adminIds.includes(req.user.id)) return res.status(403).send("Unauthorized");
+    
     config.targetGuildId = req.body.guildId;
     config.targetChannelId = req.body.channelId;
     config.botToken = req.body.botToken || config.botToken;
     config.clientId = req.body.clientId || config.clientId;
     config.clientSecret = req.body.clientSecret || config.clientSecret;
     config.callbackURL = req.body.callbackURL || config.callbackURL;
-    
     if (req.body.adminIds) {
         config.adminIds = req.body.adminIds.split(',').map(id => id.trim()).filter(id => id);
     }
 
     saveConfig();
-    
-    // Restart logic or re-init if needed
-    if (!client.isReady() && config.botToken) {
-        client.login(config.botToken).catch(console.error);
-    }
-    setupPassport();
-
+    registerStrategy();
     res.redirect('/dashboard?success=true');
 });
 
@@ -190,134 +186,121 @@ app.get('/logout', (req, res) => {
     req.logout(() => res.redirect('/'));
 });
 
-// --- Views Setup ---
+// --- Views ---
 const viewsDir = path.join(__dirname, 'views');
 if (!fs.existsSync(viewsDir)) fs.mkdirSync(viewsDir);
 
-const indexEjs = `
+fs.writeFileSync(path.join(viewsDir, 'index.ejs'), `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>نظام جلب اليوزرات - الرئيسية</title>
+    <meta charset="UTF-8"><title>نظام اليوزرات - الرئيسية</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
     <style>body { font-family: 'Tajawal', sans-serif; }</style>
 </head>
-<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center">
-    <div class="max-w-md w-full p-8 bg-gray-800 rounded-2xl shadow-2xl border border-gray-700 text-center">
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center p-4">
+    <div class="max-w-2xl w-full p-8 bg-gray-800 rounded-2xl shadow-2xl border border-gray-700 text-center">
         <h1 class="text-4xl font-bold mb-6 text-blue-500">نظام اليوزرات</h1>
-        <p class="text-gray-400 mb-8 text-lg">أهلاً بك في أقوى لوحة تحكم لإدارة بوت جلب اليوزرات الثلاثية.</p>
-        <% if (configMissing) { %>
-            <div class="bg-red-900/30 border border-red-500 text-red-200 p-4 rounded-lg mb-6">
-                تنبيه: لم يتم ضبط إعدادات Discord OAuth بعد. يرجى ضبطها في ملف الإعدادات أو البيئة.
+        
+        <% if (!isConfigured) { %>
+            <div class="bg-yellow-900/30 border border-yellow-500 text-yellow-200 p-6 rounded-xl mb-8 text-right">
+                <h2 class="text-xl font-bold mb-4">إعداد النظام لأول مرة</h2>
+                <form action="/setup" method="POST" class="space-y-4">
+                    <div>
+                        <label class="block text-sm mb-1">Bot Token</label>
+                        <input type="password" name="botToken" class="w-full bg-gray-700 p-2 rounded border border-gray-600">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm mb-1">Client ID</label>
+                            <input type="text" name="clientId" class="w-full bg-gray-700 p-2 rounded border border-gray-600">
+                        </div>
+                        <div>
+                            <label class="block text-sm mb-1">Client Secret</label>
+                            <input type="password" name="clientSecret" class="w-full bg-gray-700 p-2 rounded border border-gray-600">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm mb-1">Callback URL (مثال: https://yourapp.onrender.com/callback)</label>
+                        <input type="text" name="callbackURL" class="w-full bg-gray-700 p-2 rounded border border-gray-600">
+                    </div>
+                    <div>
+                        <label class="block text-sm mb-1">ID حسابك في ديسكورد (Admin ID)</label>
+                        <input type="text" name="adminIds" class="w-full bg-gray-700 p-2 rounded border border-gray-600">
+                    </div>
+                    <button type="submit" class="w-full bg-yellow-600 hover:bg-yellow-700 py-3 rounded-lg font-bold transition">حفظ الإعدادات الأولية</button>
+                </form>
             </div>
-        <% } %>
-        <% if (user) { %>
-            <a href="/dashboard" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-lg">
-                انتقل للوحة التحكم
-            </a>
         <% } else { %>
-            <a href="/login" class="inline-block bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-lg">
-                تسجيل الدخول عبر ديسكورد
-            </a>
+            <p class="text-gray-400 mb-8 text-lg">النظام جاهز للعمل. قم بتسجيل الدخول للإدارة.</p>
+            <% if (user) { %>
+                <a href="/dashboard" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-full shadow-lg">انتقل للوحة التحكم</a>
+            <% } else { %>
+                <a href="/login" class="inline-block bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-full shadow-lg">تسجيل الدخول عبر ديسكورد</a>
+            <% } %>
         <% } %>
     </div>
 </body>
 </html>
-`;
+`);
 
-const dashboardEjs = `
+fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>لوحة التحكم - الإعدادات</title>
+    <meta charset="UTF-8"><title>لوحة التحكم</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
     <style>body { font-family: 'Tajawal', sans-serif; }</style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
-    <nav class="bg-gray-800 border-b border-gray-700 p-4 shadow-md">
-        <div class="container mx-auto flex justify-between items-center">
-            <div class="flex items-center space-x-4 space-x-reverse">
-                <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-10 h-10 rounded-full border-2 border-blue-500">
-                <span class="font-bold text-xl"><%= user.username %></span>
-            </div>
-            <div class="text-blue-500 font-bold">لوحة التحكم الاحترافية</div>
-            <a href="/logout" class="text-red-400 hover:text-red-300">خروج</a>
+    <nav class="bg-gray-800 border-b border-gray-700 p-4 flex justify-between items-center">
+        <div class="flex items-center space-x-4 space-x-reverse">
+            <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-10 h-10 rounded-full">
+            <span class="font-bold"><%= user.username %></span>
         </div>
+        <a href="/logout" class="text-red-400">خروج</a>
     </nav>
-
     <div class="container mx-auto py-10 px-4">
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-1 space-y-6">
-                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-                    <h3 class="text-xl font-bold mb-4 text-blue-400">حالة البوت</h3>
-                    <div class="flex items-center space-x-3 space-x-reverse">
-                        <div class="w-3 h-3 <%= botUser ? 'bg-green-500 animate-pulse' : 'bg-red-500' %> rounded-full"></div>
-                        <p class="text-gray-300">البوت: <span class="text-white font-bold"><%= botUser ? botUser.username : 'غير متصل' %></span></p>
+        <div class="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-xl max-w-4xl mx-auto">
+            <h2 class="text-2xl font-bold mb-6 border-b border-gray-700 pb-4">إعدادات البوت واليوزرات</h2>
+            <form action="/update-config" method="POST" class="space-y-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-right">
+                    <div>
+                        <label class="block text-gray-400 mb-2">السيرفر المستهدف</label>
+                        <select name="guildId" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
+                            <option value="">-- اختر سيرفر --</option>
+                            <% guilds.forEach(guild => { %>
+                                <option value="<%= guild.id %>" <%= config.targetGuildId === guild.id ? 'selected' : '' %>><%= guild.name %></option>
+                            <% }) %>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-gray-400 mb-2">ID الروم لإرسال اليوزرات</label>
+                        <input type="text" name="channelId" value="<%= config.targetChannelId %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
                     </div>
                 </div>
-            </div>
-
-            <div class="lg:col-span-2">
-                <div class="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-xl">
-                    <h2 class="text-2xl font-bold mb-6 border-b border-gray-700 pb-4">إعدادات النظام</h2>
-                    <form action="/update-config" method="POST" class="space-y-6">
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div>
-                                <label class="block text-gray-400 mb-2">توكن البوت (Bot Token)</label>
-                                <input type="password" name="botToken" value="<%= config.botToken %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
-                            </div>
-                            <div>
-                                <label class="block text-gray-400 mb-2">Client ID</label>
-                                <input type="text" name="clientId" value="<%= config.clientId %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
-                            </div>
-                            <div>
-                                <label class="block text-gray-400 mb-2">Client Secret</label>
-                                <input type="password" name="clientSecret" value="<%= config.clientSecret %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
-                            </div>
-                            <div>
-                                <label class="block text-gray-400 mb-2">Callback URL</label>
-                                <input type="text" name="callbackURL" value="<%= config.callbackURL %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div>
-                                <label class="block text-gray-400 mb-2">اختر السيرفر المستهدف</label>
-                                <select name="guildId" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
-                                    <option value="">-- اختر سيرفر --</option>
-                                    <% guilds.forEach(guild => { %>
-                                        <option value="<%= guild.id %>" <%= config.targetGuildId === guild.id ? 'selected' : '' %>><%= guild.name %></option>
-                                    <% }) %>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block text-gray-400 mb-2">ID الروم (Channel ID)</label>
-                                <input type="text" name="channelId" value="<%= config.targetChannelId %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-gray-400 mb-2">الأدمن المسموح لهم (Discord IDs)</label>
-                            <input type="text" name="adminIds" value="<%= config.adminIds.join(', ') %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
-                        </div>
-                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg shadow-lg">حفظ الإعدادات</button>
-                    </form>
+                <hr class="border-gray-700">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-right">
+                    <div>
+                        <label class="block text-gray-400 mb-2">Bot Token</label>
+                        <input type="password" name="botToken" value="<%= config.botToken %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
+                    </div>
+                    <div>
+                        <label class="block text-gray-400 mb-2">Callback URL</label>
+                        <input type="text" name="callbackURL" value="<%= config.callbackURL %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
+                    </div>
                 </div>
-            </div>
+                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg shadow-lg transition">حفظ التغييرات</button>
+            </form>
         </div>
     </div>
 </body>
 </html>
-`;
+`);
 
-fs.writeFileSync(path.join(viewsDir, 'index.ejs'), indexEjs);
-fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), dashboardEjs);
-
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`Dashboard is running on http://localhost:${PORT}`);
+    console.log(`Dashboard is running on port ${PORT}`);
 });
