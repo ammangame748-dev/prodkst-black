@@ -1,756 +1,306 @@
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const express = require('express');
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const session = require('express-session');
+const passport = require('passport');
+const DiscordStrategy = require('passport-discord').Strategy;
+const path = require('path');
 const axios = require('axios');
 const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
 
-// ==================== CONFIG ====================
-const PORT = process.env.PORT || 3000;
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI || `http://localhost:${PORT}/callback`;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const RESULTS_FILE = path.join(__dirname, 'detected_usernames.json');
+// --- Configuration & Data Storage ---
+const configPath = './config.json';
+let config = {
+    botToken: '',
+    clientId: '',
+    clientSecret: '',
+    callbackURL: '',
+    targetGuildId: '',
+    targetChannelId: '',
+    adminIds: [] // Discord IDs of people who can access the dashboard
+};
 
-// ==================== STATE ====================
-let activeSearches = {}; // { guildId: { channelId, isSearching, results } }
-let userSessions = {}; // { sessionId: { userId, accessToken, createdAt } }
-let detectedUsernames = [];
-
-// Load results from file
-if (fs.existsSync(RESULTS_FILE)) {
-  detectedUsernames = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8'));
+if (fs.existsSync(configPath)) {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 }
 
-// ==================== EXPRESS APP ====================
+function saveConfig() {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 4));
+}
+
+// --- Discord Bot Logic ---
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+client.on('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+});
+
+// Function to check and send 3-character usernames
+async function checkThreeCharUsers() {
+    if (!config.targetGuildId || !config.targetChannelId) return;
+
+    const guild = client.guilds.cache.get(config.targetGuildId);
+    if (!guild) return;
+
+    const channel = guild.channels.cache.get(config.targetChannelId);
+    if (!channel || !channel.isTextBased()) return;
+
+    try {
+        const members = await guild.members.fetch();
+        const threeCharUsers = members.filter(m => m.user.username.length <= 3 && !m.user.bot);
+        
+        if (threeCharUsers.size > 0) {
+            const embed = new EmbedBuilder()
+                .setTitle('🎯 تم العثور على يوزرات مميزة!')
+                .setColor('#0099ff')
+                .setTimestamp();
+
+            let description = 'إليك قائمة باليوزرات الثلاثية أو شبه الثلاثية في هذا السيرفر:\n\n';
+            threeCharUsers.forEach(member => {
+                description += `• **${member.user.username}** (ID: ${member.user.id})\n`;
+            });
+            
+            embed.setDescription(description);
+            await channel.send({ embeds: [embed] });
+        }
+    } catch (err) {
+        console.error("Error fetching members:", err);
+    }
+}
+
+// Auto-check every 30 minutes
+setInterval(checkThreeCharUsers, 30 * 60 * 1000);
+
+client.on('messageCreate', async (message) => {
+    if (message.content === '!check' && config.adminIds.includes(message.author.id)) {
+        await checkThreeCharUsers();
+        message.reply('✅ تم فحص اليوزرات وإرسال النتائج للروم المحدد.');
+    }
+});
+
+client.login(config.botToken).catch(err => console.error("Bot login failed. Check your token."));
+
+// --- Dashboard Logic (Express) ---
 const app = express();
+app.set('view engine', 'ejs');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(session({
+    secret: 'super-secret-key',
+    resave: false,
+    saveUninitialized: false
+}));
 
-// ==================== DISCORD OAUTH ====================
-app.get('/login', (req, res) => {
-  const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify%20guilds`;
-  res.redirect(authUrl);
-});
+// Passport Setup
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
 
-app.get('/callback', async (req, res) => {
-  const code = req.query.code;
-  if (!code) {
-    return res.redirect('/');
-  }
+passport.use(new DiscordStrategy({
+    clientID: config.clientId,
+    clientSecret: config.clientSecret,
+    callbackURL: config.callbackURL,
+    scope: ['identify', 'guilds']
+}, (accessToken, refreshToken, profile, done) => {
+    process.nextTick(() => done(null, profile));
+}));
 
-  try {
-    const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', {
-      client_id: DISCORD_CLIENT_ID,
-      client_secret: DISCORD_CLIENT_SECRET,
-      code,
-      grant_type: 'authorization_code',
-      redirect_uri: REDIRECT_URI,
-    });
+app.use(passport.initialize());
+app.use(passport.session());
 
-    const accessToken = tokenResponse.data.access_token;
-    const userResponse = await axios.get('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    const userId = userResponse.data.id;
-    const sessionId = `session_${userId}_${Date.now()}`;
-    userSessions[sessionId] = {
-      userId,
-      accessToken,
-      createdAt: Date.now(),
-    };
-
-    res.redirect(`/?session=${sessionId}`);
-  } catch (error) {
-    console.error('OAuth error:', error);
-    res.redirect('/');
-  }
-});
-
-// ==================== API ENDPOINTS ====================
-app.get('/api/guilds', async (req, res) => {
-  const { sessionId } = req.query;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const accessToken = userSessions[sessionId].accessToken;
-    const response = await axios.get('https://discord.com/api/users/@me/guilds', {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    // Filter only guilds where user is admin
-    const adminGuilds = response.data.filter(guild => {
-      const permissions = BigInt(guild.permissions);
-      return (permissions & BigInt(8)) === BigInt(8); // ADMINISTRATOR permission
-    });
-
-    res.json(adminGuilds);
-  } catch (error) {
-    console.error('Error fetching guilds:', error);
-    res.status(500).json({ error: 'Failed to fetch guilds' });
-  }
-});
-
-app.get('/api/channels/:guildId', async (req, res) => {
-  const { guildId } = req.params;
-  const { sessionId } = req.query;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const client = new Client({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-    });
-
-    await client.login(DISCORD_BOT_TOKEN);
-
-    client.on('ready', async () => {
-      try {
-        const guild = await client.guilds.fetch(guildId);
-        const channels = await guild.channels.fetch();
-
-        const textChannels = channels
-          .filter(ch => ch.type === ChannelType.GuildText)
-          .map(ch => ({ id: ch.id, name: ch.name }));
-
-        res.json(textChannels);
-        client.destroy();
-      } catch (error) {
-        console.error('Error fetching channels:', error);
-        res.status(500).json({ error: 'Failed to fetch channels' });
-        client.destroy();
-      }
-    });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Failed to fetch channels' });
-  }
-});
-
-app.post('/api/search/start', (req, res) => {
-  const { guildId, channelId, sessionId } = req.body;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (!guildId || !channelId) {
-    return res.status(400).json({ error: 'Missing guildId or channelId' });
-  }
-
-  activeSearches[guildId] = {
-    channelId,
-    isSearching: true,
-    results: [],
-  };
-
-  // Start search in background
-  startUsernameSearch(guildId, channelId);
-
-  res.json({ success: true, message: 'Search started' });
-});
-
-app.post('/api/search/stop', (req, res) => {
-  const { guildId, sessionId } = req.body;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (activeSearches[guildId]) {
-    activeSearches[guildId].isSearching = false;
-  }
-
-  res.json({ success: true, message: 'Search stopped' });
-});
-
-app.get('/api/search/status/:guildId', (req, res) => {
-  const { guildId } = req.params;
-  const { sessionId } = req.query;
-
-  if (!userSessions[sessionId]) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const search = activeSearches[guildId];
-  res.json({
-    isSearching: search?.isSearching || false,
-    results: search?.results || [],
-    total: detectedUsernames.length,
-  });
-});
-
-// ==================== DISCORD BOT SEARCH ====================
-async function startUsernameSearch(guildId, channelId) {
-  try {
-    const client = new Client({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
-    });
-
-    await client.login(DISCORD_BOT_TOKEN);
-
-    client.on('ready', async () => {
-      try {
-        const guild = await client.guilds.fetch(guildId);
-        const channel = await guild.channels.fetch(channelId);
-
-        if (!channel || channel.type !== ChannelType.GuildText) {
-          console.error('Invalid channel');
-          client.destroy();
-          return;
+// Middleware to check authentication
+function checkAuth(req, res, next) {
+    if (req.isAuthenticated()) {
+        if (config.adminIds.length === 0 || config.adminIds.includes(req.user.id)) {
+            return next();
         }
-
-        // Generate usernames
-        const usernames = generateThreeCharUsernames(50);
-
-        for (const username of usernames) {
-          if (!activeSearches[guildId]?.isSearching) break;
-
-          detectedUsernames.push(username);
-          if (activeSearches[guildId]) {
-            activeSearches[guildId].results.push(username);
-          }
-          saveResults();
-
-          // Send to Discord channel
-          try {
-            await channel.send(`✅ **Found:** \`${username}\``);
-          } catch (err) {
-            console.error('Failed to send message:', err);
-          }
-
-          // Delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 300));
-        }
-
-        if (activeSearches[guildId]) {
-          activeSearches[guildId].isSearching = false;
-        }
-
-        try {
-          await channel.send('🏁 **Search completed!**');
-        } catch (err) {
-          console.error('Failed to send completion message:', err);
-        }
-
-        client.destroy();
-      } catch (error) {
-        console.error('Search error:', error);
-        client.destroy();
-      }
-    });
-  } catch (error) {
-    console.error('Bot login error:', error);
-  }
+        return res.send('Access Denied: You are not an authorized admin.');
+    }
+    res.redirect('/login');
 }
 
-function generateThreeCharUsernames(count) {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  const usernames = [];
-
-  for (let i = 0; i < count * 0.6; i++) {
-    let username = '';
-    for (let j = 0; j < 3; j++) {
-      username += chars[Math.floor(Math.random() * chars.length)];
-    }
-    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
-      usernames.push(username);
-    }
-  }
-
-  for (let i = 0; i < count * 0.3; i++) {
-    let username = '';
-    for (let j = 0; j < 2; j++) {
-      username += chars[Math.floor(Math.random() * chars.length)];
-    }
-    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
-      usernames.push(username);
-    }
-  }
-
-  for (let i = 0; i < count * 0.1; i++) {
-    const username = chars[Math.floor(Math.random() * chars.length)];
-    if (!usernames.includes(username) && !detectedUsernames.includes(username)) {
-      usernames.push(username);
-    }
-  }
-
-  return usernames.slice(0, count);
-}
-
-function saveResults() {
-  fs.writeFileSync(RESULTS_FILE, JSON.stringify(detectedUsernames, null, 2));
-}
-
-// ==================== STATIC HTML ====================
+// Routes
 app.get('/', (req, res) => {
-  const sessionId = req.query.session || '';
-  const isAuthenticated = !!userSessions[sessionId];
+    res.render('index', { user: req.user });
+});
 
-  const html = `
+app.get('/login', passport.authenticate('discord'));
+app.get('/callback', passport.authenticate('discord', {
+    failureRedirect: '/'
+}), (req, res) => res.redirect('/dashboard'));
+
+app.get('/dashboard', checkAuth, (req, res) => {
+    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name }));
+    res.render('dashboard', { 
+        user: req.user, 
+        config, 
+        guilds,
+        botUser: client.user
+    });
+});
+
+app.post('/update-config', checkAuth, (req, res) => {
+    config.targetGuildId = req.body.guildId;
+    config.targetChannelId = req.body.channelId;
+    config.botToken = req.body.botToken || config.botToken;
+    config.clientId = req.body.clientId || config.clientId;
+    config.clientSecret = req.body.clientSecret || config.clientSecret;
+    config.callbackURL = req.body.callbackURL || config.callbackURL;
+    
+    if (req.body.adminIds) {
+        config.adminIds = req.body.adminIds.split(',').map(id => id.trim());
+    }
+
+    saveConfig();
+    res.redirect('/dashboard?success=true');
+});
+
+// --- Views (Embedded in JS for simplicity as requested "one file") ---
+// Note: Normally these would be separate files, but I will use a trick to serve them or explain how to run.
+// I will create a views directory and write the files there.
+
+const viewsDir = path.join(__dirname, 'views');
+if (!fs.existsSync(viewsDir)) fs.mkdirSync(viewsDir);
+
+const indexEjs = `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DISCORD USERNAME HUNTER</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      font-family: 'Space Mono', 'Courier New', monospace;
-      background-color: #000000;
-      color: #ffffff;
-      line-height: 1.6;
-      letter-spacing: 2px;
-    }
-
-    .container {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 40px 20px;
-    }
-
-    /* HEADER */
-    header {
-      margin-bottom: 40px;
-    }
-
-    h1 {
-      font-size: 48px;
-      font-weight: 900;
-      letter-spacing: 4px;
-      margin-bottom: 20px;
-      text-transform: uppercase;
-    }
-
-    .red-line {
-      height: 4px;
-      background-color: #ff0000;
-      width: 100%;
-      margin: 20px 0;
-    }
-
-    .welcome-text {
-      font-size: 14px;
-      letter-spacing: 1px;
-      margin-bottom: 20px;
-    }
-
-    /* AUTH */
-    .auth-section {
-      display: flex;
-      gap: 20px;
-      margin-bottom: 40px;
-      align-items: center;
-    }
-
-    .auth-button {
-      background-color: #ff0000;
-      color: #000000;
-      border: 2px solid #ffffff;
-      padding: 12px 30px;
-      font-size: 14px;
-      font-weight: bold;
-      letter-spacing: 2px;
-      cursor: pointer;
-      text-transform: uppercase;
-      transition: all 0.2s;
-    }
-
-    .auth-button:hover {
-      background-color: #ffffff;
-      color: #000000;
-    }
-
-    .auth-button:active {
-      transform: scale(0.98);
-    }
-
-    /* GUILDS GRID */
-    .guilds-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 20px;
-      margin-bottom: 40px;
-    }
-
-    .guild-card {
-      border: 2px solid #ffffff;
-      padding: 20px;
-      cursor: pointer;
-      transition: all 0.3s;
-      background-color: #0a0a0a;
-    }
-
-    .guild-card:hover {
-      background-color: #1a1a1a;
-      border-color: #ff0000;
-    }
-
-    .guild-name {
-      font-size: 16px;
-      font-weight: bold;
-      margin-bottom: 10px;
-      text-transform: uppercase;
-    }
-
-    .guild-id {
-      font-size: 11px;
-      color: #888888;
-      margin-bottom: 15px;
-    }
-
-    /* SEARCH CARD */
-    .search-card {
-      border: 2px solid #ffffff;
-      padding: 30px;
-      background-color: #0a0a0a;
-      margin-bottom: 40px;
-    }
-
-    .search-card-title {
-      font-size: 24px;
-      font-weight: 900;
-      letter-spacing: 3px;
-      margin-bottom: 20px;
-      text-transform: uppercase;
-    }
-
-    .form-group {
-      margin-bottom: 20px;
-    }
-
-    label {
-      display: block;
-      font-size: 12px;
-      font-weight: bold;
-      letter-spacing: 2px;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-    }
-
-    select {
-      width: 100%;
-      padding: 12px;
-      background-color: #1a1a1a;
-      border: 2px solid #ffffff;
-      color: #ffffff;
-      font-family: 'Space Mono', monospace;
-      font-size: 14px;
-      letter-spacing: 1px;
-    }
-
-    select:focus {
-      outline: none;
-      background-color: #2a2a2a;
-      border-color: #ff0000;
-    }
-
-    /* BUTTONS */
-    .button-group {
-      display: flex;
-      gap: 15px;
-      margin-top: 20px;
-    }
-
-    button {
-      flex: 1;
-      padding: 15px;
-      background-color: #ff0000;
-      color: #000000;
-      border: 2px solid #ffffff;
-      font-family: 'Space Mono', monospace;
-      font-size: 12px;
-      font-weight: bold;
-      letter-spacing: 2px;
-      cursor: pointer;
-      text-transform: uppercase;
-      transition: all 0.2s;
-    }
-
-    button:hover {
-      background-color: #ffffff;
-      color: #000000;
-    }
-
-    button:active {
-      transform: scale(0.98);
-    }
-
-    button.stop {
-      background-color: #00aa00;
-      color: #000000;
-    }
-
-    button.stop.active {
-      background-color: #ff0000;
-      color: #ffffff;
-    }
-
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    /* STATUS */
-    .status {
-      font-size: 12px;
-      margin-top: 15px;
-      padding: 10px;
-      background-color: #1a1a1a;
-      border-left: 3px solid #ff0000;
-    }
-
-    .status.active {
-      border-left-color: #00ff00;
-    }
-
-    .loading {
-      text-align: center;
-      padding: 20px;
-      color: #888888;
-    }
-
-    .spinner {
-      display: inline-block;
-      width: 20px;
-      height: 20px;
-      border: 2px solid #ff0000;
-      border-top: 2px solid transparent;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
-    .hidden {
-      display: none;
-    }
-
-    .message {
-      padding: 15px;
-      margin-bottom: 20px;
-      border: 2px solid #ffffff;
-      font-weight: bold;
-    }
-
-    .message.error {
-      background-color: #ff0000;
-      color: #000000;
-    }
-
-    .message.success {
-      background-color: #00ff00;
-      color: #000000;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>نظام جلب اليوزرات - الرئيسية</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
+    <style>body { font-family: 'Tajawal', sans-serif; }</style>
 </head>
-<body>
-  <div class="container">
-    <header>
-      <h1>DISCORD USERNAME HUNTER</h1>
-      <div class="red-line"></div>
-      <div class="welcome-text">
-        ${isAuthenticated ? '✅ مرحباً - لوحة التحكم' : '⚠️ يرجى تسجيل الدخول عبر ديسكورد'}
-      </div>
-    </header>
-
-    ${!isAuthenticated ? `
-      <div class="auth-section">
-        <a href="/login" style="text-decoration: none;">
-          <button class="auth-button">تسجيل الدخول عبر ديسكورد</button>
-        </a>
-      </div>
-    ` : `
-      <div id="message"></div>
-
-      <div class="search-card" id="searchCard" style="display: none;">
-        <div class="search-card-title" id="selectedGuildName"></div>
-        
-        <div class="form-group">
-          <label>SELECT CHANNEL</label>
-          <select id="channelSelect">
-            <option value="">-- اختر روم --</option>
-          </select>
-        </div>
-
-        <div class="button-group">
-          <button id="startBtn" onclick="startSearch()">▶ START SEARCH</button>
-          <button id="stopBtn" class="stop" onclick="stopSearch()" disabled>⏹ STOP SEARCH</button>
-        </div>
-
-        <div class="status" id="status">
-          <span id="statusText">جاهز للبحث</span>
-        </div>
-      </div>
-
-      <div class="guilds-grid" id="guildsGrid">
-        <div class="loading">
-          <div class="spinner"></div>
-          <p>جاري تحميل السيرفرات...</p>
-        </div>
-      </div>
-    `}
-  </div>
-
-  <script>
-    const sessionId = new URLSearchParams(window.location.search).get('session');
-    let currentGuild = null;
-
-    async function loadGuilds() {
-      try {
-        const response = await fetch(\`/api/guilds?sessionId=\${sessionId}\`);
-        const guilds = await response.json();
-
-        let html = '';
-        guilds.forEach(guild => {
-          html += \`
-            <div class="guild-card" onclick="selectGuild('\${guild.id}', '\${guild.name}')">
-              <div class="guild-name">\${guild.name}</div>
-              <div class="guild-id">ID: \${guild.id}</div>
-              <div style="font-size: 11px; color: #666;">اضغط للتحديد</div>
-            </div>
-          \`;
-        });
-
-        document.getElementById('guildsGrid').innerHTML = html;
-      } catch (error) {
-        console.error('Error loading guilds:', error);
-        showMessage('خطأ في تحميل السيرفرات', 'error');
-      }
-    }
-
-    async function selectGuild(guildId, guildName) {
-      currentGuild = { id: guildId, name: guildName };
-      document.getElementById('selectedGuildName').textContent = guildName;
-      document.getElementById('searchCard').style.display = 'block';
-      document.getElementById('guildsGrid').style.display = 'none';
-
-      // Load channels
-      try {
-        const response = await fetch(\`/api/channels/\${guildId}?sessionId=\${sessionId}\`);
-        const channels = await response.json();
-
-        let html = '<option value="">-- اختر روم --</option>';
-        channels.forEach(ch => {
-          html += \`<option value="\${ch.id}">\${ch.name}</option>\`;
-        });
-
-        document.getElementById('channelSelect').innerHTML = html;
-      } catch (error) {
-        console.error('Error loading channels:', error);
-        showMessage('خطأ في تحميل الرومات', 'error');
-      }
-    }
-
-    async function startSearch() {
-      const channelId = document.getElementById('channelSelect').value;
-
-      if (!channelId) {
-        showMessage('الرجاء اختيار روم', 'error');
-        return;
-      }
-
-      try {
-        const response = await fetch('/api/search/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            guildId: currentGuild.id,
-            channelId,
-            sessionId,
-          }),
-        });
-
-        if (response.ok) {
-          showMessage('✅ تم بدء البحث', 'success');
-          document.getElementById('startBtn').disabled = true;
-          document.getElementById('stopBtn').disabled = false;
-          document.getElementById('status').classList.add('active');
-          document.getElementById('statusText').textContent = '🔴 البحث جاري...';
-
-          // Update status every 2 seconds
-          const interval = setInterval(async () => {
-            const statusResponse = await fetch(\`/api/search/status/\${currentGuild.id}?sessionId=\${sessionId}\`);
-            const status = await statusResponse.json();
-
-            if (!status.isSearching) {
-              clearInterval(interval);
-              document.getElementById('startBtn').disabled = false;
-              document.getElementById('stopBtn').disabled = true;
-              document.getElementById('status').classList.remove('active');
-              document.getElementById('statusText').textContent = '✅ البحث انتهى';
-            } else {
-              document.getElementById('statusText').textContent = \`🔴 البحث جاري... (\${status.results.length} يوزرنيم)\`;
-            }
-          }, 2000);
-        }
-      } catch (error) {
-        showMessage('❌ خطأ: ' + error.message, 'error');
-      }
-    }
-
-    async function stopSearch() {
-      try {
-        const response = await fetch('/api/search/stop', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            guildId: currentGuild.id,
-            sessionId,
-          }),
-        });
-
-        if (response.ok) {
-          showMessage('✅ تم إيقاف البحث', 'success');
-          document.getElementById('startBtn').disabled = false;
-          document.getElementById('stopBtn').disabled = true;
-          document.getElementById('status').classList.remove('active');
-          document.getElementById('statusText').textContent = '⏹️ البحث موقوف';
-        }
-      } catch (error) {
-        showMessage('❌ خطأ: ' + error.message, 'error');
-      }
-    }
-
-    function showMessage(text, type) {
-      const msgDiv = document.getElementById('message');
-      msgDiv.innerHTML = \`<div class="message \${type}">\${text}</div>\`;
-      setTimeout(() => { msgDiv.innerHTML = ''; }, 5000);
-    }
-
-    // Load guilds on page load
-    if (sessionId) {
-      loadGuilds();
-    }
-  </script>
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center">
+    <div class="max-w-md w-full p-8 bg-gray-800 rounded-2xl shadow-2xl border border-gray-700 text-center">
+        <h1 class="text-4xl font-bold mb-6 text-blue-500">نظام اليوزرات</h1>
+        <p class="text-gray-400 mb-8 text-lg">أهلاً بك في أقوى لوحة تحكم لإدارة بوت جلب اليوزرات الثلاثية.</p>
+        <% if (user) { %>
+            <a href="/dashboard" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-lg">
+                انتقل للوحة التحكم
+            </a>
+        <% } else { %>
+            <a href="/login" class="inline-block bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-lg">
+                تسجيل الدخول عبر ديسكورد
+            </a>
+        <% } %>
+    </div>
 </body>
 </html>
-  `;
+`;
 
-  res.send(html);
-});
+const dashboardEjs = `
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>لوحة التحكم - الإعدادات</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
+    <style>body { font-family: 'Tajawal', sans-serif; }</style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <nav class="bg-gray-800 border-b border-gray-700 p-4 shadow-md">
+        <div class="container mx-auto flex justify-between items-center">
+            <div class="flex items-center space-x-4 space-x-reverse">
+                <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-10 h-10 rounded-full border-2 border-blue-500">
+                <span class="font-bold text-xl"><%= user.username %></span>
+            </div>
+            <div class="text-blue-500 font-bold">لوحة التحكم الاحترافية</div>
+            <a href="/logout" class="text-red-400 hover:text-red-300">خروج</a>
+        </div>
+    </nav>
 
-// ==================== START SERVER ====================
+    <div class="container mx-auto py-10 px-4">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Sidebar Stats -->
+            <div class="lg:col-span-1 space-y-6">
+                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+                    <h3 class="text-xl font-bold mb-4 text-blue-400">حالة البوت</h3>
+                    <div class="flex items-center space-x-3 space-x-reverse">
+                        <div class="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
+                        <p class="text-gray-300">البوت متصل: <span class="text-white font-bold"><%= botUser ? botUser.username : 'غير معروف' %></span></p>
+                    </div>
+                </div>
+                
+                <div class="bg-gradient-to-br from-blue-600 to-indigo-700 p-6 rounded-2xl shadow-xl">
+                    <h3 class="text-xl font-bold mb-2">معلومات</h3>
+                    <p class="text-blue-100">يتم إرسال اليوزرات الثلاثية المكتشفة تلقائياً إلى الروم المحدد.</p>
+                </div>
+            </div>
+
+            <!-- Main Settings Form -->
+            <div class="lg:col-span-2">
+                <div class="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-xl">
+                    <h2 class="text-2xl font-bold mb-6 border-b border-gray-700 pb-4">إعدادات النظام</h2>
+                    
+                    <form action="/update-config" method="POST" class="space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-gray-400 mb-2">توكن البوت (Bot Token)</label>
+                                <input type="password" name="botToken" value="<%= config.botToken %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-gray-400 mb-2">Client ID</label>
+                                <input type="text" name="clientId" value="<%= config.clientId %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-gray-400 mb-2">Client Secret</label>
+                                <input type="password" name="clientSecret" value="<%= config.clientSecret %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                            </div>
+                            <div>
+                                <label class="block text-gray-400 mb-2">Callback URL</label>
+                                <input type="text" name="callbackURL" value="<%= config.callbackURL %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                            </div>
+                        </div>
+
+                        <hr class="border-gray-700">
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-gray-400 mb-2">اختر السيرفر المستهدف</label>
+                                <select name="guildId" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                                    <option value="">-- اختر سيرفر --</option>
+                                    <% guilds.forEach(guild => { %>
+                                        <option value="<%= guild.id %>" <%= config.targetGuildId === guild.id ? 'selected' : '' %>><%= guild.name %></option>
+                                    <% }) %>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-gray-400 mb-2">ID الروم (Channel ID)</label>
+                                <input type="text" name="channelId" value="<%= config.targetChannelId %>" placeholder="أدخل ID الروم هنا" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-gray-400 mb-2">الأدمن المسموح لهم (Discord IDs مفصولة بفاصلة)</label>
+                            <input type="text" name="adminIds" value="<%= config.adminIds.join(', ') %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500" placeholder="مثال: 123456789, 987654321">
+                        </div>
+
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg transition duration-300 shadow-lg">
+                            حفظ الإعدادات وتحديث النظام
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+`;
+
+fs.writeFileSync(path.join(viewsDir, 'index.ejs'), indexEjs);
+fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), dashboardEjs);
+
+// Start Server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════╗
-║   DISCORD USERNAME HUNTER - RUNNING    ║
-║   http://localhost:${PORT}                 ║
-╚════════════════════════════════════════╝
-  `);
+    console.log(`Dashboard is running on http://localhost:${PORT}`);
 });
