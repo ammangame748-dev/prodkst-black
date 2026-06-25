@@ -1,26 +1,31 @@
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const express = require('express');
 const session = require('express-session');
 const passport = require('passport');
 const DiscordStrategy = require('passport-discord').Strategy;
 const path = require('path');
-const axios = require('axios');
 const fs = require('fs');
+require('dotenv').config();
 
 // --- Configuration & Data Storage ---
 const configPath = './config.json';
 let config = {
-    botToken: '',
-    clientId: '',
-    clientSecret: '',
-    callbackURL: '',
-    targetGuildId: '',
-    targetChannelId: '',
-    adminIds: [] // Discord IDs of people who can access the dashboard
+    botToken: process.env.BOT_TOKEN || '',
+    clientId: process.env.CLIENT_ID || '',
+    clientSecret: process.env.CLIENT_SECRET || '',
+    callbackURL: process.env.CALLBACK_URL || '',
+    targetGuildId: process.env.TARGET_GUILD_ID || '',
+    targetChannelId: process.env.TARGET_CHANNEL_ID || '',
+    adminIds: (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(id => id)
 };
 
 if (fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    try {
+        const fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        config = { ...config, ...fileConfig };
+    } catch (e) {
+        console.error("Error reading config.json, using defaults.");
+    }
 }
 
 function saveConfig() {
@@ -32,7 +37,8 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
     ]
 });
 
@@ -40,7 +46,6 @@ client.on('ready', () => {
     console.log(`Logged in as ${client.user.tag}!`);
 });
 
-// Function to check and send 3-character usernames
 async function checkThreeCharUsers() {
     if (!config.targetGuildId || !config.targetChannelId) return;
 
@@ -73,7 +78,6 @@ async function checkThreeCharUsers() {
     }
 }
 
-// Auto-check every 30 minutes
 setInterval(checkThreeCharUsers, 30 * 60 * 1000);
 
 client.on('messageCreate', async (message) => {
@@ -83,7 +87,11 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-client.login(config.botToken).catch(err => console.error("Bot login failed. Check your token."));
+if (config.botToken) {
+    client.login(config.botToken).catch(err => console.error("Bot login failed. Check your token."));
+} else {
+    console.log("Waiting for Bot Token to be configured...");
+}
 
 // --- Dashboard Logic (Express) ---
 const app = express();
@@ -96,23 +104,31 @@ app.use(session({
     saveUninitialized: false
 }));
 
-// Passport Setup
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((obj, done) => done(null, obj));
+// Passport Setup - Wrapped in a function to handle missing credentials
+function setupPassport() {
+    if (!config.clientId || !config.clientSecret || !config.callbackURL) {
+        console.log("OAuth2 credentials missing. Dashboard login will be disabled until configured.");
+        return;
+    }
+    
+    passport.use(new DiscordStrategy({
+        clientID: config.clientId,
+        clientSecret: config.clientSecret,
+        callbackURL: config.callbackURL,
+        scope: ['identify', 'guilds']
+    }, (accessToken, refreshToken, profile, done) => {
+        process.nextTick(() => done(null, profile));
+    }));
 
-passport.use(new DiscordStrategy({
-    clientID: config.clientId,
-    clientSecret: config.clientSecret,
-    callbackURL: config.callbackURL,
-    scope: ['identify', 'guilds']
-}, (accessToken, refreshToken, profile, done) => {
-    process.nextTick(() => done(null, profile));
-}));
+    passport.serializeUser((user, done) => done(null, user));
+    passport.deserializeUser((obj, done) => done(null, obj));
+}
+
+setupPassport();
 
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Middleware to check authentication
 function checkAuth(req, res, next) {
     if (req.isAuthenticated()) {
         if (config.adminIds.length === 0 || config.adminIds.includes(req.user.id)) {
@@ -125,16 +141,20 @@ function checkAuth(req, res, next) {
 
 // Routes
 app.get('/', (req, res) => {
-    res.render('index', { user: req.user });
+    res.render('index', { user: req.user, configMissing: !config.clientId });
 });
 
-app.get('/login', passport.authenticate('discord'));
+app.get('/login', (req, res, next) => {
+    if (!config.clientId) return res.send("Config missing. Please set CLIENT_ID in environment or config.json");
+    passport.authenticate('discord')(req, res, next);
+});
+
 app.get('/callback', passport.authenticate('discord', {
     failureRedirect: '/'
 }), (req, res) => res.redirect('/dashboard'));
 
 app.get('/dashboard', checkAuth, (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name }));
+    const guilds = client.isReady() ? client.guilds.cache.map(g => ({ id: g.id, name: g.name })) : [];
     res.render('dashboard', { 
         user: req.user, 
         config, 
@@ -152,17 +172,25 @@ app.post('/update-config', checkAuth, (req, res) => {
     config.callbackURL = req.body.callbackURL || config.callbackURL;
     
     if (req.body.adminIds) {
-        config.adminIds = req.body.adminIds.split(',').map(id => id.trim());
+        config.adminIds = req.body.adminIds.split(',').map(id => id.trim()).filter(id => id);
     }
 
     saveConfig();
+    
+    // Restart logic or re-init if needed
+    if (!client.isReady() && config.botToken) {
+        client.login(config.botToken).catch(console.error);
+    }
+    setupPassport();
+
     res.redirect('/dashboard?success=true');
 });
 
-// --- Views (Embedded in JS for simplicity as requested "one file") ---
-// Note: Normally these would be separate files, but I will use a trick to serve them or explain how to run.
-// I will create a views directory and write the files there.
+app.get('/logout', (req, res) => {
+    req.logout(() => res.redirect('/'));
+});
 
+// --- Views Setup ---
 const viewsDir = path.join(__dirname, 'views');
 if (!fs.existsSync(viewsDir)) fs.mkdirSync(viewsDir);
 
@@ -181,6 +209,11 @@ const indexEjs = `
     <div class="max-w-md w-full p-8 bg-gray-800 rounded-2xl shadow-2xl border border-gray-700 text-center">
         <h1 class="text-4xl font-bold mb-6 text-blue-500">نظام اليوزرات</h1>
         <p class="text-gray-400 mb-8 text-lg">أهلاً بك في أقوى لوحة تحكم لإدارة بوت جلب اليوزرات الثلاثية.</p>
+        <% if (configMissing) { %>
+            <div class="bg-red-900/30 border border-red-500 text-red-200 p-4 rounded-lg mb-6">
+                تنبيه: لم يتم ضبط إعدادات Discord OAuth بعد. يرجى ضبطها في ملف الإعدادات أو البيئة.
+            </div>
+        <% } %>
         <% if (user) { %>
             <a href="/dashboard" class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-lg">
                 انتقل للوحة التحكم
@@ -220,27 +253,19 @@ const dashboardEjs = `
 
     <div class="container mx-auto py-10 px-4">
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Sidebar Stats -->
             <div class="lg:col-span-1 space-y-6">
                 <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
                     <h3 class="text-xl font-bold mb-4 text-blue-400">حالة البوت</h3>
                     <div class="flex items-center space-x-3 space-x-reverse">
-                        <div class="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
-                        <p class="text-gray-300">البوت متصل: <span class="text-white font-bold"><%= botUser ? botUser.username : 'غير معروف' %></span></p>
+                        <div class="w-3 h-3 <%= botUser ? 'bg-green-500 animate-pulse' : 'bg-red-500' %> rounded-full"></div>
+                        <p class="text-gray-300">البوت: <span class="text-white font-bold"><%= botUser ? botUser.username : 'غير متصل' %></span></p>
                     </div>
-                </div>
-                
-                <div class="bg-gradient-to-br from-blue-600 to-indigo-700 p-6 rounded-2xl shadow-xl">
-                    <h3 class="text-xl font-bold mb-2">معلومات</h3>
-                    <p class="text-blue-100">يتم إرسال اليوزرات الثلاثية المكتشفة تلقائياً إلى الروم المحدد.</p>
                 </div>
             </div>
 
-            <!-- Main Settings Form -->
             <div class="lg:col-span-2">
                 <div class="bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-xl">
                     <h2 class="text-2xl font-bold mb-6 border-b border-gray-700 pb-4">إعدادات النظام</h2>
-                    
                     <form action="/update-config" method="POST" class="space-y-6">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                             <div>
@@ -260,13 +285,10 @@ const dashboardEjs = `
                                 <input type="text" name="callbackURL" value="<%= config.callbackURL %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
                             </div>
                         </div>
-
-                        <hr class="border-gray-700">
-
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                             <div>
                                 <label class="block text-gray-400 mb-2">اختر السيرفر المستهدف</label>
-                                <select name="guildId" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                                <select name="guildId" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
                                     <option value="">-- اختر سيرفر --</option>
                                     <% guilds.forEach(guild => { %>
                                         <option value="<%= guild.id %>" <%= config.targetGuildId === guild.id ? 'selected' : '' %>><%= guild.name %></option>
@@ -275,18 +297,14 @@ const dashboardEjs = `
                             </div>
                             <div>
                                 <label class="block text-gray-400 mb-2">ID الروم (Channel ID)</label>
-                                <input type="text" name="channelId" value="<%= config.targetChannelId %>" placeholder="أدخل ID الروم هنا" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500">
+                                <input type="text" name="channelId" value="<%= config.targetChannelId %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
                             </div>
                         </div>
-
                         <div>
-                            <label class="block text-gray-400 mb-2">الأدمن المسموح لهم (Discord IDs مفصولة بفاصلة)</label>
-                            <input type="text" name="adminIds" value="<%= config.adminIds.join(', ') %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3 focus:outline-none focus:border-blue-500" placeholder="مثال: 123456789, 987654321">
+                            <label class="block text-gray-400 mb-2">الأدمن المسموح لهم (Discord IDs)</label>
+                            <input type="text" name="adminIds" value="<%= config.adminIds.join(', ') %>" class="w-full bg-gray-700 border border-gray-600 rounded-lg p-3">
                         </div>
-
-                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg transition duration-300 shadow-lg">
-                            حفظ الإعدادات وتحديث النظام
-                        </button>
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg shadow-lg">حفظ الإعدادات</button>
                     </form>
                 </div>
             </div>
@@ -299,7 +317,6 @@ const dashboardEjs = `
 fs.writeFileSync(path.join(viewsDir, 'index.ejs'), indexEjs);
 fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), dashboardEjs);
 
-// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Dashboard is running on http://localhost:${PORT}`);
