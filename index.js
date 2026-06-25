@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ChannelType, PermissionsBitField } = require('discord.js');
 const express = require('express');
 const session = require('express-session');
 const passport = require('passport');
@@ -7,124 +7,166 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
 
-// --- Data Storage (Using JSON to persist selection) ---
-const dbPath = './db.json';
-let db = { targetGuildId: '', targetChannelId: '', adminIds: [] };
-if (fs.existsSync(dbPath)) db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-const saveDB = () => fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
+/**
+ * --- نظام صيد اليوزرات النادرة - النسخة الكاملة المصححة ---
+ * تم تحسين هذه النسخة لتعمل بشكل مثالي على منصة Render
+ * مع معالجة كافة أخطاء الـ OAuth2 والـ Proxy.
+ */
 
-// --- Discord Bot ---
+// --- 1. إعداد قاعدة البيانات المصغرة (JSON) ---
+const dbPath = path.join(__dirname, 'db.json');
+let db = { targetGuildId: '', targetChannelId: '', adminIds: [] };
+
+if (fs.existsSync(dbPath)) {
+    try {
+        db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    } catch (e) {
+        console.error("❌ خطأ في قراءة ملف db.json، تم إنشاء ملف جديد.");
+    }
+}
+
+const saveDB = () => {
+    try {
+        fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
+    } catch (e) {
+        console.error("❌ فشل حفظ البيانات:", e);
+    }
+};
+
+// --- 2. إعداد بوت ديسكورد ---
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers]
+    intents: [
+        GatewayIntentBits.Guilds, 
+        GatewayIntentBits.GuildMessages, 
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.MessageContent
+    ]
 });
 
 client.on('ready', () => {
-    console.log(`✅ Bot ready: ${client.user.tag}`);
+    console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
     startScanner();
 });
 
-// Simulation of a global scanner (Discord doesn't allow searching "all discord" directly, 
-// so we scan all guilds the bot is in)
+// وظيفة الفحص الدوري (كل 15 دقيقة)
 async function startScanner() {
+    console.log("🔍 بدأ نظام فحص اليوزرات النادرة...");
     setInterval(async () => {
         if (!db.targetGuildId || !db.targetChannelId) return;
         
         const targetGuild = client.guilds.cache.get(db.targetGuildId);
         const targetChannel = targetGuild?.channels.cache.get(db.targetChannelId);
-        if (!targetChannel) return;
+        
+        if (!targetChannel) {
+            console.log("⚠️ لم يتم العثور على قناة النتائج المستهدفة.");
+            return;
+        }
 
-        // Logic: Scan all guilds the bot is in for 3-char users
         let foundUsers = [];
+        // فحص جميع السيرفرات التي يتواجد بها البوت
         for (const [id, guild] of client.guilds.cache) {
             try {
+                // جلب الأعضاء (يتطلب تفعيل Server Members Intent في Discord Developer Portal)
                 const members = await guild.members.fetch();
-                const rare = members.filter(m => m.user.username.length <= 3 && !m.user.bot);
-                rare.forEach(m => foundUsers.push({ name: m.user.username, guild: guild.name, id: m.user.id }));
-            } catch (e) {}
+                const rareUsers = members.filter(m => m.user.username.length <= 3 && !m.user.bot);
+                
+                rareUsers.forEach(m => {
+                    foundUsers.push({ 
+                        name: m.user.username, 
+                        guild: guild.name, 
+                        id: m.user.id 
+                    });
+                });
+            } catch (e) {
+                console.error(`❌ فشل فحص سيرفر ${guild.name}:`, e.message);
+            }
         }
 
         if (foundUsers.length > 0) {
-            // Remove duplicates and send unique ones
-            const unique = [...new Map(foundUsers.map(item => [item.name, item])).values()].slice(0, 10);
+            // إزالة التكرار وأخذ أول 10 نتائج
+            const uniqueUsers = [...new Map(foundUsers.map(u => [u.name, u])).values()].slice(0, 10);
             
             const embed = new EmbedBuilder()
                 .setTitle('💎 تم اصطياد يوزرات نادرة!')
-                .setDescription(`تم فحص جميع السيرفرات المتصلة والعثور على اليوزرات التالية:`)
+                .setDescription(`تم فحص السيرفرات والعثور على اليوزرات التالية:`)
                 .setColor('#00ffcc')
                 .setThumbnail(client.user.displayAvatarURL())
-                .setTimestamp();
+                .setTimestamp()
+                .setFooter({ text: 'نظام الصيد التلقائي' });
 
-            unique.forEach(u => {
-                embed.addFields({ name: `👤 ${u.name}`, value: `ID: \`${u.id}\` | سيرفر: \`${u.guild}\``, inline: false });
+            uniqueUsers.forEach(u => {
+                embed.addFields({ 
+                    name: `👤 ${u.name}`, 
+                    value: `ID: \`${u.id}\` | سيرفر: \`${u.guild}\``, 
+                    inline: false 
+                });
             });
 
-            await targetChannel.send({ embeds: [embed] });
+            try {
+                await targetChannel.send({ embeds: [embed] });
+                console.log(`✅ تم إرسال ${uniqueUsers.length} يوزرات إلى القناة.`);
+            } catch (e) {
+                console.error("❌ فشل إرسال الإمبد:", e.message);
+            }
         }
-    }, 15 * 60 * 1000); // Every 15 mins
+    }, 15 * 60 * 1000); 
 }
 
-client.login(process.env.BOT_TOKEN).catch(e => console.error("Bot Login Failed"));
+client.login(process.env.BOT_TOKEN).catch(e => {
+    console.error("❌ فشل تسجيل دخول البوت! تأكد من BOT_TOKEN.");
+});
 
-// --- Express App ---
+// --- 3. إعداد تطبيق ويب (Express) ---
 const app = express();
+
+// إعدادات Render والـ Proxy (حل مشكلة InternalOAuthError)
+app.set('trust proxy', 1);
+
 app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(session({ secret: 'ultra-secret', resave: false, saveUninitialized: false }));
 
+// إعداد الجلسات (Sessions)
+app.use(session({
+    secret: 'rare-user-hunter-secret-2024',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 1000 * 60 * 60 * 24 // 24 ساعة
+    }
+}));
+
+// إعداد Passport و Discord Strategy
 passport.use(new DiscordStrategy({
     clientID: process.env.CLIENT_ID,
     clientSecret: process.env.CLIENT_SECRET,
     callbackURL: process.env.CALLBACK_URL,
-    scope: ['identify', 'guilds']
-}, (at, rt, profile, done) => done(null, profile)));
+    scope: ['identify', 'guilds'],
+    prompt: 'none'
+}, (accessToken, refreshToken, profile, done) => {
+    return done(null, profile);
+}));
 
-passport.serializeUser((u, d) => d(null, u));
-passport.deserializeUser((o, d) => d(null, o));
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
+
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Middleware
-const isAuth = (req, res, next) => req.isAuthenticated() ? next() : res.redirect('/');
-
-// Routes
-app.get('/', (req, res) => res.render('login'));
-app.get('/auth', passport.authenticate('discord'));
-app.get('/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => res.redirect('/dashboard'));
-
-app.get('/dashboard', isAuth, (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name }));
-    res.render('dashboard', { user: req.user, guilds, db });
-});
-
-// API to get channels for a guild
-app.get('/api/channels/:guildId', isAuth, (req, res) => {
-    const guild = client.guilds.cache.get(req.params.guildId);
-    if (!guild) return res.json([]);
-    const channels = guild.channels.cache
-        .filter(c => c.type === ChannelType.GuildText)
-        .map(c => ({ id: c.id, name: c.name }));
-    res.json(channels);
-});
-
-app.post('/save', isAuth, (req, res) => {
-    db.targetGuildId = req.body.guildId;
-    db.targetChannelId = req.body.channelId;
-    saveDB();
-    res.redirect('/dashboard?success=1');
-});
-
-app.get('/logout', (req, res) => req.logout(() => res.redirect('/')));
-
-// --- Views ---
+// --- 4. الواجهات (Views) ---
 const viewsDir = path.join(__dirname, 'views');
 if (!fs.existsSync(viewsDir)) fs.mkdirSync(viewsDir);
 
+// صفحة تسجيل الدخول
 fs.writeFileSync(path.join(viewsDir, 'login.ejs'), `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8"><title>تسجيل الدخول</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>تسجيل الدخول | نظام اليوزرات</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap" rel="stylesheet">
     <style>body { font-family: 'Cairo', sans-serif; background: radial-gradient(circle at top right, #1e1b4b, #0f172a); }</style>
@@ -142,11 +184,13 @@ fs.writeFileSync(path.join(viewsDir, 'login.ejs'), `
 </html>
 `);
 
+// لوحة التحكم
 fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8"><title>لوحة التحكم</title>
+    <meta charset="UTF-8">
+    <title>لوحة التحكم | نظام اليوزرات</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap" rel="stylesheet">
     <style>body { font-family: 'Cairo', sans-serif; background: #0f172a; }</style>
@@ -155,7 +199,7 @@ fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
     <nav class="bg-white/5 border-b border-white/10 p-6">
         <div class="container mx-auto flex justify-between items-center">
             <div class="flex items-center gap-4">
-                <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-12 h-12 rounded-full ring-2 ring-indigo-500">
+                <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-12 h-12 rounded-full ring-2 ring-indigo-500" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
                 <div>
                     <p class="font-bold text-lg"><%= user.username %></p>
                     <p class="text-xs text-gray-400">مسؤول النظام</p>
@@ -204,16 +248,18 @@ fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
 
         async function loadChannels(guildId) {
             if(!guildId) return;
-            const res = await fetch('/api/channels/' + guildId);
-            const channels = await res.json();
-            channelSelect.innerHTML = '<option value="">-- اختر القناة --</option>';
-            channels.forEach(c => {
-                const opt = document.createElement('option');
-                opt.value = c.id;
-                opt.textContent = '#' + c.name;
-                if(c.id === savedChannelId) opt.selected = true;
-                channelSelect.appendChild(opt);
-            });
+            try {
+                const res = await fetch('/api/channels/' + guildId);
+                const channels = await res.json();
+                channelSelect.innerHTML = '<option value="">-- اختر القناة --</option>';
+                channels.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c.id;
+                    opt.textContent = '#' + c.name;
+                    if(c.id === savedChannelId) opt.selected = true;
+                    channelSelect.appendChild(opt);
+                });
+            } catch (e) { console.error("Error loading channels:", e); }
         }
 
         guildSelect.addEventListener('change', (e) => loadChannels(e.target.value));
@@ -223,5 +269,79 @@ fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
 </html>
 `);
 
+// --- 5. المسارات (Routes) ---
+
+// Middleware للتأكد من تسجيل الدخول
+const isAuth = (req, res, next) => {
+    if (req.isAuthenticated()) return next();
+    res.redirect('/');
+};
+
+app.get('/', (req, res) => {
+    if (req.isAuthenticated()) return res.redirect('/dashboard');
+    res.render('login');
+});
+
+// بدء عملية المصادقة مع ديسكورد
+app.get('/auth', passport.authenticate('discord'));
+
+// استلام الرد من ديسكورد
+app.get('/callback', (req, res, next) => {
+    passport.authenticate('discord', (err, user, info) => {
+        if (err) {
+            console.error("❌ خطأ OAuth2:", err);
+            return res.status(500).send(`
+                <div style="font-family: sans-serif; padding: 20px; text-align: center;">
+                    <h2>فشل تسجيل الدخول</h2>
+                    <p>السبب: ${err.message}</p>
+                    <a href="/">العودة للرئيسية</a>
+                </div>
+            `);
+        }
+        if (!user) return res.redirect('/');
+        
+        req.logIn(user, (err) => {
+            if (err) return next(err);
+            res.redirect('/dashboard');
+        });
+    })(req, res, next);
+});
+
+// لوحة التحكم
+app.get('/dashboard', isAuth, (req, res) => {
+    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name }));
+    res.render('dashboard', { user: req.user, guilds, db });
+});
+
+// API لجلب القنوات النصية للسيرفر
+app.get('/api/channels/:guildId', isAuth, (req, res) => {
+    const guild = client.guilds.cache.get(req.params.guildId);
+    if (!guild) return res.json([]);
+    
+    const channels = guild.channels.cache
+        .filter(c => c.type === ChannelType.GuildText)
+        .map(c => ({ id: c.id, name: c.name }));
+    res.json(channels);
+});
+
+// حفظ الإعدادات
+app.post('/save', isAuth, (req, res) => {
+    db.targetGuildId = req.body.guildId;
+    db.targetChannelId = req.body.channelId;
+    saveDB();
+    res.redirect('/dashboard?success=1');
+});
+
+// تسجيل الخروج
+app.get('/logout', (req, res) => {
+    req.logout((err) => {
+        res.redirect('/');
+    });
+});
+
+// --- 6. تشغيل الخادم ---
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 System running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🚀 نظام الويب يعمل على المنفذ: ${PORT}`);
+    console.log(`🔗 الرابط المحلي: http://localhost:${PORT}`);
+});
