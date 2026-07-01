@@ -273,3 +273,25 @@ process.on('uncaughtException', error => {
 });
 
 startBot();
+// ==================== [ خادم الويب الأساسي لمنصة Render ] ====================
+const http = require('http');
+
+// إنشاء سيرفر وهمي للرد على سيرفرات Render وتجنب إغلاق البوت
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('البوت يعمل بكفاءة 24/7 على منصة Render 🚀\n');
+});
+
+// Render يقوم بتعيين رقم البورت تلقائياً في متغير البيئة PORT، وإذا لم يجده يختار 3000
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+    console.log(`🌐 تم فتح البورت بنجاح! خادم الويب يستمع الآن على المنفذ: ${PORT}`);
+});
+
+// ==================== [ تسجيل دخول البوت ] ====================
+// تأكد من إضافة متغير البيئة TOKEN في إعدادات Render
+client.login(process.env.TOKEN).catch(err => {
+    console.error("❌ فشل تسجيل دخول البوت! تأكد من صحة التوكن (TOKEN):", err);
+});
+
