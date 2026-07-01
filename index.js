@@ -1,37 +1,6 @@
 /**
  * ==============================================================================
- * 🚀 ديسكورد بوت متكامل (All-in-One) - Slash Commands
- * ==============================================================================
- * 
- * 🛠️ ما هو Slash Command؟
- * أوامر السلاش هي الطريقة الحديثة للتفاعل مع البوتات في ديسكورد. بدلاً من البادئات (مثل !)، 
- * تستخدم "/" لتظهر لك قائمة الأوامر مع شرح لكل منها، مما يسهل الاستخدام ويقلل الأخطاء.
- * 
- * 📋 قائمة الأوامر المبرمجة (18 أمر):
- * 1.  /ping        - فحص استجابة البوت.
- * 2.  /help        - عرض قائمة الأوامر والشرح.
- * 3.  /userinfo    - معلومات عن مستخدم معين.
- * 4.  /serverinfo  - معلومات عن السيرفر.
- * 5.  /avatar      - عرض صورة الملف الشخصي.
- * 6.  /kick        - طرد عضو (إدارة).
- * 7.  /ban         - حظر عضو (إدارة).
- * 8.  /timeout     - إسكات عضو مؤقتاً (إدارة).
- * 9.  /clear       - مسح الرسائل (إدارة).
- * 10. /8ball       - كرة الحظ للإجابة على الأسئلة.
- * 11. /say         - جعل البوت يكرر كلامك.
- * 12. /roll        - رمي النرد.
- * 13. /echo        - تكرار رسالة (مع خيار الإخفاء).
- * 14. /poll        - إنشاء استطلاع رأي.
- * 15. /weather     - حالة الطقس لمدينة معينة.
- * 16. /meme        - جلب ميمز عشوائية.
- * 17. /remindme    - تعيين تذكير شخصي.
- * 18. /translate   - ترجمة النصوص بين اللغات.
- * 
- * ⚙️ المتغيرات المستخدمة (من Render/Environment):
- * - BOT_TOKEN
- * - CLIENT_ID
- * - CLIENT_SECRET
- * - CALLBACK_URL
+ * 🚀 ديسكورد بوت متكامل (All-in-One) - النسخة المصلحة لـ Render
  * ==============================================================================
  */
 
@@ -39,6 +8,8 @@ const {
     Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, 
     PermissionFlagsBits, REST, Routes 
 } = require('discord.js');
+
+// استيراد node-fetch بشكل متوافق
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 // 1. إعداد العميل (Client)
@@ -53,12 +24,10 @@ const client = new Client({
 
 // 2. تعريف الأوامر
 const commands = [
-    // 1. Ping
     {
         data: new SlashCommandBuilder().setName('ping').setDescription('يرد بـ Pong!'),
         async execute(interaction) { await interaction.reply('Pong! 🏓'); }
     },
-    // 2. Help
     {
         data: new SlashCommandBuilder().setName('help').setDescription('يعرض قائمة بجميع الأوامر المتاحة.'),
         async execute(interaction) {
@@ -75,7 +44,6 @@ const commands = [
             await interaction.reply({ embeds: [embed] });
         }
     },
-    // 3. UserInfo
     {
         data: new SlashCommandBuilder().setName('userinfo').setDescription('يعرض معلومات المستخدم.').addUserOption(o => o.setName('target').setDescription('المستخدم')),
         async execute(interaction) {
@@ -88,12 +56,11 @@ const commands = [
                 .addFields(
                     { name: 'المعرف ID', value: user.id, inline: true },
                     { name: 'انضم للديسكورد', value: `<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true },
-                    { name: 'انضم للسيرفر', value: `<t:${Math.floor(member.joinedTimestamp/1000)}:R>`, inline: true }
+                    { name: 'انضم للسيرفر', value: member ? `<t:${Math.floor(member.joinedTimestamp/1000)}:R>` : 'غير متوفر', inline: true }
                 );
             await interaction.reply({ embeds: [embed] });
         }
     },
-    // 4. ServerInfo
     {
         data: new SlashCommandBuilder().setName('serverinfo').setDescription('معلومات السيرفر.'),
         async execute(interaction) {
@@ -109,7 +76,6 @@ const commands = [
             await interaction.reply({ embeds: [embed] });
         }
     },
-    // 5. Avatar
     {
         data: new SlashCommandBuilder().setName('avatar').setDescription('عرض الأفاتار.').addUserOption(o => o.setName('target').setDescription('المستخدم')),
         async execute(interaction) {
@@ -117,7 +83,6 @@ const commands = [
             await interaction.reply(user.displayAvatarURL({ dynamic: true, size: 1024 }));
         }
     },
-    // 6. Kick
     {
         data: new SlashCommandBuilder().setName('kick').setDescription('طرد عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('السبب')).setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
         async execute(interaction) {
@@ -128,7 +93,6 @@ const commands = [
             await interaction.reply(`✅ تم طرد ${target.user.tag}. السبب: ${reason}`);
         }
     },
-    // 7. Ban
     {
         data: new SlashCommandBuilder().setName('ban').setDescription('حظر عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('السبب')).setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
         async execute(interaction) {
@@ -138,7 +102,6 @@ const commands = [
             await interaction.reply(`🚫 تم حظر ${target.tag}. السبب: ${reason}`);
         }
     },
-    // 8. Timeout
     {
         data: new SlashCommandBuilder().setName('timeout').setDescription('إسكات عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addIntegerOption(o => o.setName('time').setDescription('الدقائق').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
         async execute(interaction) {
@@ -148,7 +111,6 @@ const commands = [
             await interaction.reply(`🤐 تم إسكات ${target.user.tag} لمدة ${time} دقيقة.`);
         }
     },
-    // 9. Clear
     {
         data: new SlashCommandBuilder().setName('clear').setDescription('مسح رسائل.').addIntegerOption(o => o.setName('amount').setDescription('العدد').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
         async execute(interaction) {
@@ -158,7 +120,6 @@ const commands = [
             await interaction.reply({ content: `🗑️ تم مسح ${amount} رسالة.`, ephemeral: true });
         }
     },
-    // 10. 8ball
     {
         data: new SlashCommandBuilder().setName('8ball').setDescription('اسأل الكرة السحرية.').addStringOption(o => o.setName('question').setDescription('سؤالك').setRequired(true)),
         async execute(interaction) {
@@ -167,17 +128,14 @@ const commands = [
             await interaction.reply(`🔮 **السؤال:** ${interaction.options.getString('question')}\n✨ **الإجابة:** ${ans}`);
         }
     },
-    // 11. Say
     {
         data: new SlashCommandBuilder().setName('say').setDescription('البوت يتكلم.').addStringOption(o => o.setName('msg').setDescription('الرسالة').setRequired(true)),
         async execute(interaction) { await interaction.reply(interaction.options.getString('msg')); }
     },
-    // 12. Roll
     {
         data: new SlashCommandBuilder().setName('roll').setDescription('رمي نرد.'),
         async execute(interaction) { await interaction.reply(`🎲 النتيجة: ${Math.floor(Math.random() * 6) + 1}`); }
     },
-    // 13. Echo
     {
         data: new SlashCommandBuilder().setName('echo').setDescription('تكرار الكلام.').addStringOption(o => o.setName('text').setRequired(true).setDescription('النص')).addBooleanOption(o => o.setName('hidden').setDescription('إخفاء؟')),
         async execute(interaction) {
@@ -186,7 +144,6 @@ const commands = [
             await interaction.reply({ content: text, ephemeral: hidden });
         }
     },
-    // 14. Poll
     {
         data: new SlashCommandBuilder().setName('poll').setDescription('تصويت.').addStringOption(o => o.setName('q').setDescription('السؤال').setRequired(true)).addStringOption(o => o.setName('options').setDescription('الخيارات مفصولة بـ ,').setRequired(true)),
         async execute(interaction) {
@@ -200,16 +157,13 @@ const commands = [
             opts.forEach(async (_, i) => { if(i < 5) await msg.react(emojis[i]); });
         }
     },
-    // 15. Weather
     {
         data: new SlashCommandBuilder().setName('weather').setDescription('الطقس.').addStringOption(o => o.setName('city').setDescription('المدينة').setRequired(true)),
         async execute(interaction) {
             const city = interaction.options.getString('city');
-            // ملاحظة: يتطلب API Key حقيقي، هنا مثال بسيط
             await interaction.reply(`🌦️ جاري البحث عن طقس مدينة ${city}... (تأكد من إعداد API Key في الكود الحقيقي)`);
         }
     },
-    // 16. Meme
     {
         data: new SlashCommandBuilder().setName('meme').setDescription('ميم عشوائي.'),
         async execute(interaction) {
@@ -221,7 +175,6 @@ const commands = [
             } catch (e) { await interaction.reply('❌ فشل جلب الميم'); }
         }
     },
-    // 17. RemindMe
     {
         data: new SlashCommandBuilder().setName('remindme').setDescription('تذكير.').addIntegerOption(o => o.setName('time').setDescription('بالدقائق').setRequired(true)).addStringOption(o => o.setName('msg').setDescription('الرسالة').setRequired(true)),
         async execute(interaction) {
@@ -231,7 +184,6 @@ const commands = [
             setTimeout(() => interaction.user.send(`🔔 تذكير: ${msg}`).catch(() => {}), time * 60000);
         }
     },
-    // 18. Translate
     {
         data: new SlashCommandBuilder().setName('translate').setDescription('ترجمة سريعة.').addStringOption(o => o.setName('text').setRequired(true).setDescription('النص')).addStringOption(o => o.setName('to').setRequired(true).setDescription('إلى لغة (en, ar)')),
         async execute(interaction) {
@@ -247,9 +199,13 @@ const commands = [
 ];
 
 // 3. تسجيل الأوامر (Deploy)
-const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
+const deployCommands = async () => {
+    if (!process.env.BOT_TOKEN || !process.env.CLIENT_ID) {
+        console.error('❌ خطأ: BOT_TOKEN أو CLIENT_ID غير موجود في المتغيرات البيئية!');
+        return;
+    }
 
-(async () => {
+    const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
     try {
         console.log('🔄 جاري تحديث أوامر السلاش...');
         await rest.put(
@@ -260,7 +216,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
     } catch (error) {
         console.error('❌ خطأ في تسجيل الأوامر:', error);
     }
-})();
+};
 
 // 4. معالجة التفاعلات
 client.on('interactionCreate', async interaction => {
@@ -270,10 +226,50 @@ client.on('interactionCreate', async interaction => {
     try {
         await command.execute(interaction);
     } catch (error) {
-        console.error(error);
-        await interaction.reply({ content: '❌ حدث خطأ أثناء تنفيذ الأمر!', ephemeral: true });
+        console.error('❌ خطأ أثناء تنفيذ الأمر:', error);
+        if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ content: '❌ حدث خطأ أثناء تنفيذ الأمر!', ephemeral: true });
+        }
     }
 });
 
-client.once('ready', () => console.log(`🤖 تم تشغيل البوت باسم: ${client.user.tag}`));
-client.login(process.env.BOT_TOKEN);
+client.once('ready', () => {
+    console.log(`🤖 تم تشغيل البوت باسم: ${client.user.tag}`);
+    console.log('🚀 البوت الآن متصل وجاهز للعمل!');
+});
+
+// 5. بدء التشغيل ومعالجة الأخطاء
+const startBot = async () => {
+    try {
+        await deployCommands();
+        await client.login(process.env.BOT_TOKEN);
+    } catch (error) {
+        console.error('❌ فشل بدء تشغيل البوت:', error);
+        process.exit(1);
+    }
+};
+
+// التعامل مع إشارات الإنهاء لضمان إغلاق نظيف على Render
+process.on('SIGTERM', () => {
+    console.log('👋 تلقى إشارة SIGTERM، إغلاق البوت بشكل نظيف...');
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('👋 تلقى إشارة SIGINT، إغلاق البوت بشكل نظيف...');
+    client.destroy();
+    process.exit(0);
+});
+
+// التعامل مع الأخطاء غير المتوقعة لمنع تعليق العملية
+process.on('unhandledRejection', error => {
+    console.error('❌ خطأ غير معالج (Unhandled Rejection):', error);
+});
+
+process.on('uncaughtException', error => {
+    console.error('❌ خطأ غير متوقع (Uncaught Exception):', error);
+    process.exit(1);
+});
+
+startBot();
