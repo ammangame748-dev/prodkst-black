@@ -1,347 +1,279 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ChannelType, PermissionsBitField } = require('discord.js');
-const express = require('express');
-const session = require('express-session');
-const passport = require('passport');
-const DiscordStrategy = require('passport-discord').Strategy;
-const path = require('path');
-const fs = require('fs');
-require('dotenv').config();
-
 /**
- * --- نظام صيد اليوزرات النادرة - النسخة الكاملة المصححة ---
- * تم تحسين هذه النسخة لتعمل بشكل مثالي على منصة Render
- * مع معالجة كافة أخطاء الـ OAuth2 والـ Proxy.
+ * ==============================================================================
+ * 🚀 ديسكورد بوت متكامل (All-in-One) - Slash Commands
+ * ==============================================================================
+ * 
+ * 🛠️ ما هو Slash Command؟
+ * أوامر السلاش هي الطريقة الحديثة للتفاعل مع البوتات في ديسكورد. بدلاً من البادئات (مثل !)، 
+ * تستخدم "/" لتظهر لك قائمة الأوامر مع شرح لكل منها، مما يسهل الاستخدام ويقلل الأخطاء.
+ * 
+ * 📋 قائمة الأوامر المبرمجة (18 أمر):
+ * 1.  /ping        - فحص استجابة البوت.
+ * 2.  /help        - عرض قائمة الأوامر والشرح.
+ * 3.  /userinfo    - معلومات عن مستخدم معين.
+ * 4.  /serverinfo  - معلومات عن السيرفر.
+ * 5.  /avatar      - عرض صورة الملف الشخصي.
+ * 6.  /kick        - طرد عضو (إدارة).
+ * 7.  /ban         - حظر عضو (إدارة).
+ * 8.  /timeout     - إسكات عضو مؤقتاً (إدارة).
+ * 9.  /clear       - مسح الرسائل (إدارة).
+ * 10. /8ball       - كرة الحظ للإجابة على الأسئلة.
+ * 11. /say         - جعل البوت يكرر كلامك.
+ * 12. /roll        - رمي النرد.
+ * 13. /echo        - تكرار رسالة (مع خيار الإخفاء).
+ * 14. /poll        - إنشاء استطلاع رأي.
+ * 15. /weather     - حالة الطقس لمدينة معينة.
+ * 16. /meme        - جلب ميمز عشوائية.
+ * 17. /remindme    - تعيين تذكير شخصي.
+ * 18. /translate   - ترجمة النصوص بين اللغات.
+ * 
+ * ⚙️ المتغيرات المستخدمة (من Render/Environment):
+ * - BOT_TOKEN
+ * - CLIENT_ID
+ * - CLIENT_SECRET
+ * - CALLBACK_URL
+ * ==============================================================================
  */
 
-// --- 1. إعداد قاعدة البيانات المصغرة (JSON) ---
-const dbPath = path.join(__dirname, 'db.json');
-let db = { targetGuildId: '', targetChannelId: '', adminIds: [] };
+const { 
+    Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, 
+    PermissionFlagsBits, REST, Routes 
+} = require('discord.js');
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
-if (fs.existsSync(dbPath)) {
-    try {
-        db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-    } catch (e) {
-        console.error("❌ خطأ في قراءة ملف db.json، تم إنشاء ملف جديد.");
-    }
-}
-
-const saveDB = () => {
-    try {
-        fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
-    } catch (e) {
-        console.error("❌ فشل حفظ البيانات:", e);
-    }
-};
-
-// --- 2. إعداد بوت ديسكورد ---
-const client = new Client({
+// 1. إعداد العميل (Client)
+const client = new Client({ 
     intents: [
         GatewayIntentBits.Guilds, 
         GatewayIntentBits.GuildMessages, 
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent
-    ]
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMessageReactions
+    ] 
 });
 
-client.on('ready', () => {
-    console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
-    startScanner();
-});
-
-// وظيفة الفحص الدوري (كل 15 دقيقة)
-async function startScanner() {
-    console.log("🔍 بدأ نظام فحص اليوزرات النادرة...");
-    setInterval(async () => {
-        if (!db.targetGuildId || !db.targetChannelId) return;
-        
-        const targetGuild = client.guilds.cache.get(db.targetGuildId);
-        const targetChannel = targetGuild?.channels.cache.get(db.targetChannelId);
-        
-        if (!targetChannel) {
-            console.log("⚠️ لم يتم العثور على قناة النتائج المستهدفة.");
-            return;
-        }
-
-        let foundUsers = [];
-        // فحص جميع السيرفرات التي يتواجد بها البوت
-        for (const [id, guild] of client.guilds.cache) {
-            try {
-                // جلب الأعضاء (يتطلب تفعيل Server Members Intent في Discord Developer Portal)
-                const members = await guild.members.fetch();
-                const rareUsers = members.filter(m => m.user.username.length <= 3 && !m.user.bot);
-                
-                rareUsers.forEach(m => {
-                    foundUsers.push({ 
-                        name: m.user.username, 
-                        guild: guild.name, 
-                        id: m.user.id 
-                    });
-                });
-            } catch (e) {
-                console.error(`❌ فشل فحص سيرفر ${guild.name}:`, e.message);
-            }
-        }
-
-        if (foundUsers.length > 0) {
-            // إزالة التكرار وأخذ أول 10 نتائج
-            const uniqueUsers = [...new Map(foundUsers.map(u => [u.name, u])).values()].slice(0, 10);
-            
+// 2. تعريف الأوامر
+const commands = [
+    // 1. Ping
+    {
+        data: new SlashCommandBuilder().setName('ping').setDescription('يرد بـ Pong!'),
+        async execute(interaction) { await interaction.reply('Pong! 🏓'); }
+    },
+    // 2. Help
+    {
+        data: new SlashCommandBuilder().setName('help').setDescription('يعرض قائمة بجميع الأوامر المتاحة.'),
+        async execute(interaction) {
             const embed = new EmbedBuilder()
-                .setTitle('💎 تم اصطياد يوزرات نادرة!')
-                .setDescription(`تم فحص السيرفرات والعثور على اليوزرات التالية:`)
-                .setColor('#00ffcc')
-                .setThumbnail(client.user.displayAvatarURL())
-                .setTimestamp()
-                .setFooter({ text: 'نظام الصيد التلقائي' });
-
-            uniqueUsers.forEach(u => {
-                embed.addFields({ 
-                    name: `👤 ${u.name}`, 
-                    value: `ID: \`${u.id}\` | سيرفر: \`${u.guild}\``, 
-                    inline: false 
-                });
-            });
-
-            try {
-                await targetChannel.send({ embeds: [embed] });
-                console.log(`✅ تم إرسال ${uniqueUsers.length} يوزرات إلى القناة.`);
-            } catch (e) {
-                console.error("❌ فشل إرسال الإمبد:", e.message);
-            }
+                .setColor(0x00FF00)
+                .setTitle('📋 لوحة تحكم الأوامر')
+                .setDescription('جميع الأوامر تعمل بنظام السلاش (/)')
+                .addFields(
+                    { name: '🛠️ عام', value: '`/ping`, `/help`, `/userinfo`, `/serverinfo`, `/avatar`, `/echo`' },
+                    { name: '🛡️ إشراف', value: '`/kick`, `/ban`, `/timeout`, `/clear`' },
+                    { name: '🎮 ترفيه', value: '`/8ball`, `/say`, `/roll`, `/meme`' },
+                    { name: '🔧 أدوات', value: '`/poll`, `/weather`, `/remindme`, `/translate`' }
+                );
+            await interaction.reply({ embeds: [embed] });
         }
-    }, 15 * 60 * 1000); 
-}
-
-client.login(process.env.BOT_TOKEN).catch(e => {
-    console.error("❌ فشل تسجيل دخول البوت! تأكد من BOT_TOKEN.");
-});
-
-// --- 3. إعداد تطبيق ويب (Express) ---
-const app = express();
-
-// إعدادات Render والـ Proxy (حل مشكلة InternalOAuthError)
-app.set('trust proxy', 1);
-
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// إعداد الجلسات (Sessions)
-app.use(session({
-    secret: 'rare-user-hunter-secret-2024',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        secure: process.env.NODE_ENV === 'production',
-        maxAge: 1000 * 60 * 60 * 24 // 24 ساعة
+    },
+    // 3. UserInfo
+    {
+        data: new SlashCommandBuilder().setName('userinfo').setDescription('يعرض معلومات المستخدم.').addUserOption(o => o.setName('target').setDescription('المستخدم')),
+        async execute(interaction) {
+            const user = interaction.options.getUser('target') || interaction.user;
+            const member = interaction.guild.members.cache.get(user.id);
+            const embed = new EmbedBuilder()
+                .setColor(0x0099FF)
+                .setTitle(`👤 معلومات: ${user.username}`)
+                .setThumbnail(user.displayAvatarURL())
+                .addFields(
+                    { name: 'المعرف ID', value: user.id, inline: true },
+                    { name: 'انضم للديسكورد', value: `<t:${Math.floor(user.createdTimestamp/1000)}:R>`, inline: true },
+                    { name: 'انضم للسيرفر', value: `<t:${Math.floor(member.joinedTimestamp/1000)}:R>`, inline: true }
+                );
+            await interaction.reply({ embeds: [embed] });
+        }
+    },
+    // 4. ServerInfo
+    {
+        data: new SlashCommandBuilder().setName('serverinfo').setDescription('معلومات السيرفر.'),
+        async execute(interaction) {
+            const { guild } = interaction;
+            const embed = new EmbedBuilder()
+                .setColor(0xFFCC00)
+                .setTitle(`🏰 ${guild.name}`)
+                .addFields(
+                    { name: 'المالك', value: `<@${guild.ownerId}>`, inline: true },
+                    { name: 'الأعضاء', value: `${guild.memberCount}`, inline: true },
+                    { name: 'تاريخ الإنشاء', value: `<t:${Math.floor(guild.createdTimestamp/1000)}:F>` }
+                );
+            await interaction.reply({ embeds: [embed] });
+        }
+    },
+    // 5. Avatar
+    {
+        data: new SlashCommandBuilder().setName('avatar').setDescription('عرض الأفاتار.').addUserOption(o => o.setName('target').setDescription('المستخدم')),
+        async execute(interaction) {
+            const user = interaction.options.getUser('target') || interaction.user;
+            await interaction.reply(user.displayAvatarURL({ dynamic: true, size: 1024 }));
+        }
+    },
+    // 6. Kick
+    {
+        data: new SlashCommandBuilder().setName('kick').setDescription('طرد عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('السبب')).setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+        async execute(interaction) {
+            const target = interaction.options.getMember('target');
+            const reason = interaction.options.getString('reason') || 'لا يوجد سبب';
+            if (!target.kickable) return interaction.reply({ content: '❌ لا أستطيع طرده!', ephemeral: true });
+            await target.kick(reason);
+            await interaction.reply(`✅ تم طرد ${target.user.tag}. السبب: ${reason}`);
+        }
+    },
+    // 7. Ban
+    {
+        data: new SlashCommandBuilder().setName('ban').setDescription('حظر عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('السبب')).setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+        async execute(interaction) {
+            const target = interaction.options.getUser('target');
+            const reason = interaction.options.getString('reason') || 'لا يوجد سبب';
+            await interaction.guild.members.ban(target, { reason });
+            await interaction.reply(`🚫 تم حظر ${target.tag}. السبب: ${reason}`);
+        }
+    },
+    // 8. Timeout
+    {
+        data: new SlashCommandBuilder().setName('timeout').setDescription('إسكات عضو.').addUserOption(o => o.setName('target').setDescription('العضو').setRequired(true)).addIntegerOption(o => o.setName('time').setDescription('الدقائق').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+        async execute(interaction) {
+            const target = interaction.options.getMember('target');
+            const time = interaction.options.getInteger('time');
+            await target.timeout(time * 60 * 1000);
+            await interaction.reply(`🤐 تم إسكات ${target.user.tag} لمدة ${time} دقيقة.`);
+        }
+    },
+    // 9. Clear
+    {
+        data: new SlashCommandBuilder().setName('clear').setDescription('مسح رسائل.').addIntegerOption(o => o.setName('amount').setDescription('العدد').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+        async execute(interaction) {
+            const amount = interaction.options.getInteger('amount');
+            if (amount > 100 || amount < 1) return interaction.reply({ content: 'العدد بين 1-100', ephemeral: true });
+            await interaction.channel.bulkDelete(amount, true);
+            await interaction.reply({ content: `🗑️ تم مسح ${amount} رسالة.`, ephemeral: true });
+        }
+    },
+    // 10. 8ball
+    {
+        data: new SlashCommandBuilder().setName('8ball').setDescription('اسأل الكرة السحرية.').addStringOption(o => o.setName('question').setDescription('سؤالك').setRequired(true)),
+        async execute(interaction) {
+            const answers = ['نعم', 'لا', 'ربما', 'مستحيل', 'بالتأكيد', 'اسأل لاحقاً'];
+            const ans = answers[Math.floor(Math.random() * answers.length)];
+            await interaction.reply(`🔮 **السؤال:** ${interaction.options.getString('question')}\n✨ **الإجابة:** ${ans}`);
+        }
+    },
+    // 11. Say
+    {
+        data: new SlashCommandBuilder().setName('say').setDescription('البوت يتكلم.').addStringOption(o => o.setName('msg').setDescription('الرسالة').setRequired(true)),
+        async execute(interaction) { await interaction.reply(interaction.options.getString('msg')); }
+    },
+    // 12. Roll
+    {
+        data: new SlashCommandBuilder().setName('roll').setDescription('رمي نرد.'),
+        async execute(interaction) { await interaction.reply(`🎲 النتيجة: ${Math.floor(Math.random() * 6) + 1}`); }
+    },
+    // 13. Echo
+    {
+        data: new SlashCommandBuilder().setName('echo').setDescription('تكرار الكلام.').addStringOption(o => o.setName('text').setRequired(true).setDescription('النص')).addBooleanOption(o => o.setName('hidden').setDescription('إخفاء؟')),
+        async execute(interaction) {
+            const text = interaction.options.getString('text');
+            const hidden = interaction.options.getBoolean('hidden') || false;
+            await interaction.reply({ content: text, ephemeral: hidden });
+        }
+    },
+    // 14. Poll
+    {
+        data: new SlashCommandBuilder().setName('poll').setDescription('تصويت.').addStringOption(o => o.setName('q').setDescription('السؤال').setRequired(true)).addStringOption(o => o.setName('options').setDescription('الخيارات مفصولة بـ ,').setRequired(true)),
+        async execute(interaction) {
+            const q = interaction.options.getString('q');
+            const opts = interaction.options.getString('options').split(',');
+            const emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+            let desc = '';
+            opts.forEach((opt, i) => { if(i < 5) desc += `${emojis[i]} ${opt.trim()}\n`; });
+            const embed = new EmbedBuilder().setTitle(`📊 ${q}`).setDescription(desc).setColor(0x00AAFF);
+            const msg = await interaction.reply({ embeds: [embed], fetchReply: true });
+            opts.forEach(async (_, i) => { if(i < 5) await msg.react(emojis[i]); });
+        }
+    },
+    // 15. Weather
+    {
+        data: new SlashCommandBuilder().setName('weather').setDescription('الطقس.').addStringOption(o => o.setName('city').setDescription('المدينة').setRequired(true)),
+        async execute(interaction) {
+            const city = interaction.options.getString('city');
+            // ملاحظة: يتطلب API Key حقيقي، هنا مثال بسيط
+            await interaction.reply(`🌦️ جاري البحث عن طقس مدينة ${city}... (تأكد من إعداد API Key في الكود الحقيقي)`);
+        }
+    },
+    // 16. Meme
+    {
+        data: new SlashCommandBuilder().setName('meme').setDescription('ميم عشوائي.'),
+        async execute(interaction) {
+            try {
+                const res = await fetch('https://meme-api.com/gimme');
+                const data = await res.json();
+                const embed = new EmbedBuilder().setTitle(data.title).setImage(data.url).setColor('Random');
+                await interaction.reply({ embeds: [embed] });
+            } catch (e) { await interaction.reply('❌ فشل جلب الميم'); }
+        }
+    },
+    // 17. RemindMe
+    {
+        data: new SlashCommandBuilder().setName('remindme').setDescription('تذكير.').addIntegerOption(o => o.setName('time').setDescription('بالدقائق').setRequired(true)).addStringOption(o => o.setName('msg').setDescription('الرسالة').setRequired(true)),
+        async execute(interaction) {
+            const time = interaction.options.getInteger('time');
+            const msg = interaction.options.getString('msg');
+            await interaction.reply({ content: `⏰ سأذكرك بعد ${time} دقيقة.`, ephemeral: true });
+            setTimeout(() => interaction.user.send(`🔔 تذكير: ${msg}`).catch(() => {}), time * 60000);
+        }
+    },
+    // 18. Translate
+    {
+        data: new SlashCommandBuilder().setName('translate').setDescription('ترجمة سريعة.').addStringOption(o => o.setName('text').setRequired(true).setDescription('النص')).addStringOption(o => o.setName('to').setRequired(true).setDescription('إلى لغة (en, ar)')),
+        async execute(interaction) {
+            const text = interaction.options.getString('text');
+            const to = interaction.options.getString('to');
+            try {
+                const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=auto|${to}`);
+                const data = await res.json();
+                await interaction.reply(`🌐 **الترجمة:** ${data.responseData.translatedText}`);
+            } catch (e) { await interaction.reply('❌ فشلت الترجمة'); }
+        }
     }
-}));
+];
 
-// إعداد Passport و Discord Strategy
-passport.use(new DiscordStrategy({
-    clientID: process.env.CLIENT_ID,
-    clientSecret: process.env.CLIENT_SECRET,
-    callbackURL: process.env.CALLBACK_URL,
-    scope: ['identify', 'guilds'],
-    prompt: 'none'
-}, (accessToken, refreshToken, profile, done) => {
-    return done(null, profile);
-}));
+// 3. تسجيل الأوامر (Deploy)
+const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((obj, done) => done(null, obj));
+(async () => {
+    try {
+        console.log('🔄 جاري تحديث أوامر السلاش...');
+        await rest.put(
+            Routes.applicationCommands(process.env.CLIENT_ID),
+            { body: commands.map(c => c.data.toJSON()) },
+        );
+        console.log('✅ تم تسجيل الأوامر بنجاح!');
+    } catch (error) {
+        console.error('❌ خطأ في تسجيل الأوامر:', error);
+    }
+})();
 
-app.use(passport.initialize());
-app.use(passport.session());
-
-// --- 4. الواجهات (Views) ---
-const viewsDir = path.join(__dirname, 'views');
-if (!fs.existsSync(viewsDir)) fs.mkdirSync(viewsDir);
-
-// صفحة تسجيل الدخول
-fs.writeFileSync(path.join(viewsDir, 'login.ejs'), `
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>تسجيل الدخول | نظام اليوزرات</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap" rel="stylesheet">
-    <style>body { font-family: 'Cairo', sans-serif; background: radial-gradient(circle at top right, #1e1b4b, #0f172a); }</style>
-</head>
-<body class="text-white min-h-screen flex items-center justify-center">
-    <div class="bg-white/5 backdrop-blur-xl p-10 rounded-3xl border border-white/10 shadow-2xl text-center max-w-sm w-full">
-        <div class="w-20 h-20 bg-indigo-600 rounded-2xl mx-auto mb-6 flex items-center justify-center shadow-lg shadow-indigo-500/50">
-            <svg class="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-        </div>
-        <h1 class="text-3xl font-bold mb-2">نظام اليوزرات</h1>
-        <p class="text-gray-400 mb-8">أهلاً بك، سجل دخولك للبدء في صيد اليوزرات النادرة.</p>
-        <a href="/auth" class="block w-full bg-indigo-600 hover:bg-indigo-500 py-4 rounded-xl font-bold transition-all transform hover:scale-105 active:scale-95 shadow-xl shadow-indigo-600/20">تسجيل الدخول عبر ديسكورد</a>
-    </div>
-</body>
-</html>
-`);
-
-// لوحة التحكم
-fs.writeFileSync(path.join(viewsDir, 'dashboard.ejs'), `
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <title>لوحة التحكم | نظام اليوزرات</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700&display=swap" rel="stylesheet">
-    <style>body { font-family: 'Cairo', sans-serif; background: #0f172a; }</style>
-</head>
-<body class="text-white">
-    <nav class="bg-white/5 border-b border-white/10 p-6">
-        <div class="container mx-auto flex justify-between items-center">
-            <div class="flex items-center gap-4">
-                <img src="https://cdn.discordapp.com/avatars/<%= user.id %>/<%= user.avatar %>.png" class="w-12 h-12 rounded-full ring-2 ring-indigo-500" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
-                <div>
-                    <p class="font-bold text-lg"><%= user.username %></p>
-                    <p class="text-xs text-gray-400">مسؤول النظام</p>
-                </div>
-            </div>
-            <a href="/logout" class="bg-red-500/10 text-red-500 px-4 py-2 rounded-lg hover:bg-red-500 hover:text-white transition">خروج</a>
-        </div>
-    </nav>
-
-    <main class="container mx-auto py-12 px-4">
-        <div class="max-w-3xl mx-auto">
-            <div class="bg-white/5 border border-white/10 p-8 rounded-3xl shadow-2xl">
-                <h2 class="text-2xl font-bold mb-8 flex items-center gap-3">
-                    <span class="w-2 h-8 bg-indigo-500 rounded-full"></span>
-                    إعدادات الصيد المستهدف
-                </h2>
-                
-                <form action="/save" method="POST" class="space-y-8">
-                    <div class="space-y-4">
-                        <label class="block text-gray-400 font-medium">اختر السيرفر</label>
-                        <select name="guildId" id="guildSelect" class="w-full bg-white/5 border border-white/10 p-4 rounded-xl focus:outline-none focus:ring-2 ring-indigo-500 transition cursor-pointer">
-                            <option value="">-- اختر السيرفر المستهدف --</option>
-                            <% guilds.forEach(g => { %>
-                                <option value="<%= g.id %>" <%= db.targetGuildId === g.id ? 'selected' : '' %>><%= g.name %></option>
-                            <% }) %>
-                        </select>
-                    </div>
-
-                    <div class="space-y-4">
-                        <label class="block text-gray-400 font-medium">اختر الروم (قناة النتائج)</label>
-                        <select name="channelId" id="channelSelect" class="w-full bg-white/5 border border-white/10 p-4 rounded-xl focus:outline-none focus:ring-2 ring-indigo-500 transition cursor-pointer">
-                            <option value="">-- اختر القناة أولاً --</option>
-                        </select>
-                    </div>
-
-                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 py-5 rounded-2xl font-bold text-xl transition-all shadow-xl shadow-indigo-600/20">حفظ الإعدادات وبدء الفحص</button>
-                </form>
-            </div>
-        </div>
-    </main>
-
-    <script>
-        const guildSelect = document.getElementById('guildSelect');
-        const channelSelect = document.getElementById('channelSelect');
-        const savedChannelId = "<%= db.targetChannelId %>";
-
-        async function loadChannels(guildId) {
-            if(!guildId) return;
-            try {
-                const res = await fetch('/api/channels/' + guildId);
-                const channels = await res.json();
-                channelSelect.innerHTML = '<option value="">-- اختر القناة --</option>';
-                channels.forEach(c => {
-                    const opt = document.createElement('option');
-                    opt.value = c.id;
-                    opt.textContent = '#' + c.name;
-                    if(c.id === savedChannelId) opt.selected = true;
-                    channelSelect.appendChild(opt);
-                });
-            } catch (e) { console.error("Error loading channels:", e); }
-        }
-
-        guildSelect.addEventListener('change', (e) => loadChannels(e.target.value));
-        if(guildSelect.value) loadChannels(guildSelect.value);
-    </script>
-</body>
-</html>
-`);
-
-// --- 5. المسارات (Routes) ---
-
-// Middleware للتأكد من تسجيل الدخول
-const isAuth = (req, res, next) => {
-    if (req.isAuthenticated()) return next();
-    res.redirect('/');
-};
-
-app.get('/', (req, res) => {
-    if (req.isAuthenticated()) return res.redirect('/dashboard');
-    res.render('login');
+// 4. معالجة التفاعلات
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+    const command = commands.find(c => c.data.name === interaction.commandName);
+    if (!command) return;
+    try {
+        await command.execute(interaction);
+    } catch (error) {
+        console.error(error);
+        await interaction.reply({ content: '❌ حدث خطأ أثناء تنفيذ الأمر!', ephemeral: true });
+    }
 });
 
-// بدء عملية المصادقة مع ديسكورد
-app.get('/auth', passport.authenticate('discord'));
-
-// استلام الرد من ديسكورد
-app.get('/callback', (req, res, next) => {
-    passport.authenticate('discord', (err, user, info) => {
-        if (err) {
-            console.error("❌ خطأ OAuth2:", err);
-            return res.status(500).send(`
-                <div style="font-family: sans-serif; padding: 20px; text-align: center;">
-                    <h2>فشل تسجيل الدخول</h2>
-                    <p>السبب: ${err.message}</p>
-                    <a href="/">العودة للرئيسية</a>
-                </div>
-            `);
-        }
-        if (!user) return res.redirect('/');
-        
-        req.logIn(user, (err) => {
-            if (err) return next(err);
-            res.redirect('/dashboard');
-        });
-    })(req, res, next);
-});
-
-// لوحة التحكم
-app.get('/dashboard', isAuth, (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name }));
-    res.render('dashboard', { user: req.user, guilds, db });
-});
-
-// API لجلب القنوات النصية للسيرفر
-app.get('/api/channels/:guildId', isAuth, (req, res) => {
-    const guild = client.guilds.cache.get(req.params.guildId);
-    if (!guild) return res.json([]);
-    
-    const channels = guild.channels.cache
-        .filter(c => c.type === ChannelType.GuildText)
-        .map(c => ({ id: c.id, name: c.name }));
-    res.json(channels);
-});
-
-// حفظ الإعدادات
-app.post('/save', isAuth, (req, res) => {
-    db.targetGuildId = req.body.guildId;
-    db.targetChannelId = req.body.channelId;
-    saveDB();
-    res.redirect('/dashboard?success=1');
-});
-
-// تسجيل الخروج
-app.get('/logout', (req, res) => {
-    req.logout((err) => {
-        res.redirect('/');
-    });
-});
-
-// --- 6. تشغيل الخادم ---
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`🚀 نظام الويب يعمل على المنفذ: ${PORT}`);
-    console.log(`🔗 الرابط المحلي: http://localhost:${PORT}`);
-});
+client.once('ready', () => console.log(`🤖 تم تشغيل البوت باسم: ${client.user.tag}`));
+client.login(process.env.BOT_TOKEN);
